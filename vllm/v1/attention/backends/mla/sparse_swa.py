@@ -25,9 +25,14 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
 )
+from vllm.v1.attention.backends.mla.sparse_mla_env import (
+    is_triton_sparse_mla_enabled,
+    is_triton_sparse_mla_enabled_for_platform,
+)
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     KVCacheSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
@@ -176,12 +181,9 @@ class DeepseekSparseSWAMetadata:
 
     # Pre-computed prefill metadata shared across all DeepseekV4 attention layers.
     prefill_seq_lens: torch.Tensor | None = None
-    prefill_seq_lens_cpu: torch.Tensor | None = None
     prefill_gather_lens: torch.Tensor | None = None
-    prefill_query_lens_cpu: torch.Tensor | None = None
-    prefill_window_size: int = 0
-    prefill_max_model_len: int = 0
-    prefill_max_num_batched_tokens: int = 0
+    prefill_seq_lens_cpu: torch.Tensor | None = None
+    prefill_gather_lens_cpu: torch.Tensor | None = None
 
     # Per-layer-type FlashMLA tile-scheduler metadata. One FlashMLASchedMeta
     # per present DeepseekV4 layer type, shared across all ~60 layers of that type
@@ -199,79 +201,6 @@ class DeepseekSparseSWAMetadata:
     flashinfer_sparse_index_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = field(
         default_factory=dict
     )
-
-    def get_prefill_chunk_plan(
-        self, compress_ratio: int, prefill_chunk_size: int
-    ) -> list[tuple[int, int, int, int]]:
-        if self.num_prefills == 0:
-            return []
-
-        assert self.prefill_seq_lens_cpu is not None
-        assert self.prefill_query_lens_cpu is not None
-
-        # query_len <= max_num_batched_tokens and
-        # gather_len = query_len + min(prefix_len, window_size - 1), so the
-        # worst-case gathered width is bounded by
-        # max_num_batched_tokens + window_size - 1. The compressed prefix pool
-        # is bounded by ceil(max_model_len / compress_ratio).
-        max_workspace_area = prefill_chunk_size * (
-            (
-                0
-                if compress_ratio <= 1
-                else cdiv(self.prefill_max_model_len, compress_ratio)
-            )
-            + self.prefill_window_size
-            + self.prefill_max_num_batched_tokens
-        )
-        prefix_lens_cpu = self.prefill_seq_lens_cpu - self.prefill_query_lens_cpu
-        gather_lens_cpu = self.prefill_query_lens_cpu + torch.clamp(
-            prefix_lens_cpu, min=0, max=self.prefill_window_size - 1
-        )
-        compressed_lens_cpu = (
-            torch.zeros_like(self.prefill_seq_lens_cpu)
-            if compress_ratio <= 1
-            else torch.div(
-                self.prefill_seq_lens_cpu,
-                compress_ratio,
-                rounding_mode="floor",
-            )
-        )
-
-        chunk_plan: list[tuple[int, int, int, int]] = []
-        chunk_start = 0
-        while chunk_start < self.num_prefills:
-            chunk_max_compressed = int(compressed_lens_cpu[chunk_start].item())
-            chunk_max_gather = int(gather_lens_cpu[chunk_start].item())
-            chunk_end = chunk_start + 1
-
-            while chunk_end < self.num_prefills:
-                candidate_max_compressed = max(
-                    chunk_max_compressed,
-                    int(compressed_lens_cpu[chunk_end].item()),
-                )
-                candidate_max_gather = max(
-                    chunk_max_gather,
-                    int(gather_lens_cpu[chunk_end].item()),
-                )
-                candidate_width = candidate_max_compressed + candidate_max_gather
-                candidate_area = (chunk_end - chunk_start + 1) * candidate_width
-                if candidate_area > max_workspace_area:
-                    break
-                chunk_max_compressed = candidate_max_compressed
-                chunk_max_gather = candidate_max_gather
-                chunk_end += 1
-
-            chunk_plan.append(
-                (
-                    chunk_start,
-                    chunk_end,
-                    chunk_max_compressed,
-                    chunk_max_compressed + chunk_max_gather,
-                )
-            )
-            chunk_start = chunk_end
-
-        return chunk_plan
 
 
 class ComputePrefillMetadataKernel(
@@ -392,6 +321,19 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     supports_draft_decode_metadata_update = True
 
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: AttentionSpec,
+    ) -> AttentionCGSupport:
+        if (
+            getattr(kv_cache_spec, "model_version", None) == "deepseek_v4"
+            and is_triton_sparse_mla_enabled_for_platform()
+        ):
+            return AttentionCGSupport.NEVER
+        return cls._cudagraph_support
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         assert isinstance(self.kv_cache_spec, SlidingWindowMLASpec | MLAAttentionSpec)
@@ -400,10 +342,6 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         assert isinstance(mla_spec.tokens_per_state, int)
         self.compress_ratio = mla_spec.tokens_per_state
         self.block_size = mla_spec.block_size
-        self.max_model_len = self.vllm_config.model_config.max_model_len
-        self.max_num_batched_tokens = (
-            self.vllm_config.scheduler_config.max_num_batched_tokens
-        )
 
         # Handle MTP: adjust decode_threshold like the indexer does
         spec_config = self.vllm_config.speculative_config
@@ -502,7 +440,6 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         For prefill, we use chunked prefill to align with the indexer's chunking.
         """
         seq_lens = common_attn_metadata.seq_lens
-        seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
         query_start_loc = common_attn_metadata.query_start_loc
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         block_table = common_attn_metadata.block_table_tensor
@@ -605,9 +542,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             num_decodes,
             num_prefills,
             seq_lens,
-            seq_lens_cpu,
             query_start_loc,
             query_start_loc_cpu,
+            common_attn_metadata.seq_lens_cpu_upper_bound,
         )
 
         # Per-layer-type tile-scheduler plan holders. Empty FlashMLASchedMeta
@@ -652,7 +589,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             tile_sched_swaonly=tile_sched[_LAYER_TYPE_SWAONLY],
             tile_sched_c4a=tile_sched[_LAYER_TYPE_C4A],
             tile_sched_c128a=tile_sched[_LAYER_TYPE_C128A],
-            **deepseek_v4_fields,  # type: ignore[arg-type]
+            **deepseek_v4_fields,
         )
 
     def update_draft_decode_metadata(
@@ -715,6 +652,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             or current_platform.is_device_capability_family(120)
         ):
             return out
+        if is_triton_sparse_mla_enabled(self.device):
+            return out
         for layer_type in self._layer_types:
             # get_mla_metadata() is the official FlashMLA entry point that
             # returns a fresh empty FlashMLASchedMeta; using it keeps this
@@ -728,10 +667,10 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         num_decodes: int,
         num_prefills: int,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor | None,
         query_start_loc: torch.Tensor,
         query_start_loc_cpu: torch.Tensor,
-    ) -> dict[str, torch.Tensor | int | None]:
+        seq_lens_cpu_upper_bound: torch.Tensor | None,
+    ) -> dict[str, torch.Tensor | None]:
         """Pre-compute DeepseekV4 prefill metadata during the metadata build phase.
 
         Returns a dict of keyword arguments to pass to the
@@ -740,11 +679,10 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         Note: C128A sparse metadata is computed by the FlashMLASparse builder
         (which owns the C128A block_table), not here.
         """
-        result: dict[str, torch.Tensor | int | None] = {}
+        result: dict[str, torch.Tensor | None] = {}
 
         # --- Prefill query metadata (single Triton kernel + CPU slicing) ---
         if num_prefills > 0:
-            assert seq_lens_cpu is not None
             pfx_gather_lens = torch.empty(
                 num_prefills, dtype=torch.int32, device=seq_lens.device
             )
@@ -757,16 +695,27 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 self.window_size,
             )
 
-            result["prefill_seq_lens"] = seq_lens[num_decodes:]
-            result["prefill_seq_lens_cpu"] = seq_lens_cpu[num_decodes:]
-            result["prefill_gather_lens"] = pfx_gather_lens
-            result["prefill_query_lens_cpu"] = (
-                query_start_loc_cpu[num_decodes + 1 : num_decodes + num_prefills + 1]
+            assert seq_lens_cpu_upper_bound is not None
+            seq_lens_cpu = seq_lens_cpu_upper_bound
+            prefill_seq_lens_cpu = seq_lens_cpu[
+                num_decodes : num_decodes + num_prefills
+            ]
+            query_lens_cpu = (
+                query_start_loc_cpu[
+                    num_decodes + 1 : num_decodes + num_prefills + 1
+                ]
                 - query_start_loc_cpu[num_decodes : num_decodes + num_prefills]
-            ).to(dtype=torch.int32)
-            result["prefill_window_size"] = self.window_size
-            result["prefill_max_model_len"] = self.max_model_len
-            result["prefill_max_num_batched_tokens"] = self.max_num_batched_tokens
+            )
+            prefix_lens_cpu = prefill_seq_lens_cpu - query_lens_cpu
+            prefill_gather_lens_cpu = query_lens_cpu + torch.minimum(
+                prefix_lens_cpu,
+                torch.full_like(prefix_lens_cpu, self.window_size - 1),
+            )
+
+            result["prefill_seq_lens"] = seq_lens[num_decodes:]
+            result["prefill_gather_lens"] = pfx_gather_lens
+            result["prefill_seq_lens_cpu"] = prefill_seq_lens_cpu
+            result["prefill_gather_lens_cpu"] = prefill_gather_lens_cpu
 
         return result
 

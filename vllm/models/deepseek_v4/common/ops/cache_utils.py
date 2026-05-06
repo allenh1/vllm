@@ -438,6 +438,7 @@ def compute_global_topk_indices_and_lens(
     block_table: torch.Tensor,
     block_size: int,
     is_valid_token: torch.Tensor,
+    output_buffers: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Map local topk indices to global KV cache slots and count valid entries.
 
@@ -447,8 +448,19 @@ def compute_global_topk_indices_and_lens(
     3. Masking padding tokens to length 0
     """
     num_tokens = topk_indices.shape[0]
-    global_topk_indices = torch.empty_like(topk_indices)
-    topk_lens = torch.empty(num_tokens, dtype=torch.int32, device=topk_indices.device)
+    if output_buffers is None:
+        global_topk_indices = torch.empty_like(topk_indices)
+        topk_lens = torch.empty(
+            num_tokens, dtype=torch.int32, device=topk_indices.device
+        )
+    else:
+        global_topk_indices, topk_lens = output_buffers
+        assert global_topk_indices.shape == topk_indices.shape
+        assert global_topk_indices.dtype == topk_indices.dtype
+        assert global_topk_indices.device == topk_indices.device
+        assert topk_lens.shape == (num_tokens,)
+        assert topk_lens.dtype == torch.int32
+        assert topk_lens.device == topk_indices.device
     _compute_global_topk_indices_and_lens_kernel[(num_tokens,)](
         global_topk_indices,
         global_topk_indices.stride(0),
@@ -495,7 +507,7 @@ def _compute_global_topk_indices_and_lens_kernel(
             mask=mask,
             other=-1,
         )
-        is_valid = local_idx >= 0
+        is_valid = (local_idx >= 0) & is_valid_token
 
         block_indices = local_idx // block_size
         block_numbers = tl.load(
@@ -525,6 +537,14 @@ def _compute_global_topk_indices_and_lens_kernel(
 _SPARSE_PREFILL_TOPK_ALIGNMENT = 128
 
 
+def sparse_prefill_combined_topk_size(topk: int, window_size: int) -> int:
+    return (
+        (topk + window_size + _SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
+        // _SPARSE_PREFILL_TOPK_ALIGNMENT
+        * _SPARSE_PREFILL_TOPK_ALIGNMENT
+    )
+
+
 def combine_topk_swa_indices(
     topk_indices: torch.Tensor,
     query_start_loc: torch.Tensor,
@@ -538,11 +558,7 @@ def combine_topk_swa_indices(
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_tokens = topk_indices.shape[0]
-    combined_topk = (
-        (topk + window_size + _SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
-        // _SPARSE_PREFILL_TOPK_ALIGNMENT
-        * _SPARSE_PREFILL_TOPK_ALIGNMENT
-    )
+    combined_topk = sparse_prefill_combined_topk_size(topk, window_size)
     if out is None:
         combined_indices = torch.full(
             (num_tokens, combined_topk),
@@ -555,6 +571,16 @@ def combine_topk_swa_indices(
         )
     else:
         combined_indices, combined_lens = out
+        assert combined_indices.shape[0] >= num_tokens
+        assert combined_indices.shape[1] >= combined_topk
+        assert combined_indices.dtype == torch.int32
+        assert combined_indices.device == topk_indices.device
+        combined_indices = combined_indices[:num_tokens, :combined_topk]
+        combined_indices.fill_(-1)
+        assert combined_lens.shape[0] >= num_tokens
+        assert combined_lens.dtype == torch.int32
+        assert combined_lens.device == topk_indices.device
+        combined_lens = combined_lens[:num_tokens]
 
     _COMBINE_TOPK_SWA_INDICES_KERNEL(
         combined_indices,

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.config import CompilationConfig
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     bind_routed_experts_capturer,
 )
@@ -108,8 +109,8 @@ def test_deep_gemm_mega_moe_capture_precedes_eplb(monkeypatch, use_kimi):
 
 def test_deepseek_v4_mega_moe_weight_loader_uses_ep_expert_ownership():
     vllm_config = SimpleNamespace(
+        compilation_config=CompilationConfig(),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=4),
-        compilation_config=SimpleNamespace(static_forward_context={}),
     )
     experts = DeepseekV4MegaMoEExperts(
         vllm_config,
@@ -317,7 +318,7 @@ def test_deepseek_v4_mega_moe_does_not_double_add_fused_shared_expert(
     reason="DeepSeek V4 MegaMoE fused input staging requires CUDA.",
 )
 def test_deepseek_v4_mega_moe_fused_input_staging_is_bitwise_exact():
-    from vllm.third_party.deep_gemm.utils import per_token_cast_to_fp8
+    deep_gemm_utils = pytest.importorskip("deep_gemm.utils")
 
     device = torch.device("cuda")
     num_tokens = 7
@@ -356,7 +357,7 @@ def test_deepseek_v4_mega_moe_fused_input_staging_is_bitwise_exact():
         generator=generator,
     )
 
-    ref_x, ref_x_sf = per_token_cast_to_fp8(
+    ref_x, ref_x_sf = deep_gemm_utils.per_token_cast_to_fp8(
         hidden_states,
         use_ue8m0=True,
         gran_k=32,

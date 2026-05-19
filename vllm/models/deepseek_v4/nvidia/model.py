@@ -84,6 +84,7 @@ from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.utils import deep_gemm
 from vllm.utils.flashinfer_moe_ep import (
     is_fi_moe_ep_backend,
     validate_fi_moe_ep_config,
@@ -498,10 +499,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         ).squeeze(0)
 
     def finalize_weights(self, shared_experts: DeepseekV4MLP | None = None) -> None:
-        from vllm.utils.deep_gemm import _import_deep_gemm
-
-        deep_gemm = _import_deep_gemm()
-
         if self._transformed_l1_weights is None:
             self._check_runtime_supported()
             w13_scale = deep_gemm.transform_sf_into_required_layout(
@@ -555,10 +552,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         return self._transformed_shared_l1_weights is not None
 
     def get_symm_buffer(self):
-        from vllm.utils.deep_gemm import _import_deep_gemm
-
-        deep_gemm = _import_deep_gemm()
-
         group = get_ep_group().device_group
         device = torch.accelerator.current_device_index()
         key = (
@@ -652,10 +645,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 f"but the symmetric buffer was sized for {self.max_num_tokens}."
             )
         y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
-
-        from vllm.utils.deep_gemm import _import_deep_gemm
-
-        deep_gemm = _import_deep_gemm()
 
         symm_buffer = self.get_symm_buffer()
         num_tokens = hidden_states.shape[0]

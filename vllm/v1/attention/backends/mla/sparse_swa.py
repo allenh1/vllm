@@ -329,20 +329,11 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         self.compress_ratio = mla_spec.tokens_per_state
         self.block_size = mla_spec.block_size
 
-        # Handle MTP: adjust decode_threshold like the indexer does
-        spec_config = self.vllm_config.speculative_config
-        self.num_speculative_tokens = (
-            spec_config.num_speculative_tokens if spec_config else 0
-        )
-        # Decode can have query_len up to
-        #   1 + (2 if parallel drafting else 1) * num_speculative_tokens.
-        # sparse_swa has no MQA-vs-dense-MHA routing, so multi-token queries take
-        # the prefill path and the decode/prefill split stays at that width.
-        spec_mult = (
-            2 if (spec_config is not None and spec_config.parallel_drafting) else 1
-        )
-        self.decode_threshold = 1 + spec_mult * self.num_speculative_tokens
-        self.reorder_batch_threshold = None
+        # Handle MTP: classify single-token queries plus speculative tokens as
+        # decodes, matching the runner-side batch reorder threshold.
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        assert self.reorder_batch_threshold is not None
+        self.decode_threshold = self.reorder_batch_threshold
 
         hf_config = self.vllm_config.model_config.hf_config
         assert hasattr(hf_config, "sliding_window")

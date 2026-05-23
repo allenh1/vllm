@@ -6,7 +6,7 @@ from math import lcm
 from typing import NamedTuple
 
 from vllm.logger import init_logger
-from vllm.utils.math_utils import cdiv, round_down
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
@@ -746,45 +746,16 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             if group.use_eagle
         }
 
-    def _align_cacheable(self, num_tokens: int) -> int:
-        """Largest prefix of ``num_tokens`` a future cache hit could match.
-
-        Hits are ``scheduler_block_size``-aligned (see
-        ``find_longest_cache_hit``) unless fine-grained partial hash hits are
-        enabled, in which case no rounding applies -- rounding even to
-        ``hash_block_size`` would re-register a privatized Mamba tail.
-        """
-        if self.enable_partial_hash_hits:
-            return num_tokens
-        return round_down(num_tokens, self.scheduler_block_size)
-
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
-        cached_num_computed_tokens = self._align_cacheable(num_computed_tokens)
+        # Cache hits in this coordinator are always a multiple of
+        # ``scheduler_block_size`` tokens (see ``find_longest_cache_hit``).
+        # Managers may still cache complete tail blocks after the last aligned
+        # boundary; ``find_longest_cache_hit`` keeps returned hits aligned.
         for manager in self.single_type_managers:
-            num_tokens_to_cache = cached_num_computed_tokens
-            # EAGLE groups match one block past each aligned boundary and drop
-            # it, so make that lookahead block eligible to be cached.
-            if manager.use_eagle and cached_num_computed_tokens > 0:
-                # Only cache tokens with finalized KV. The last
-                # num_reprefillable_tokens tokens can be re-prefilled during
-                # multi-module MTP.
-                num_finalized_computed_tokens = max(
-                    0, num_computed_tokens - self.num_reprefillable_tokens
-                )
-                cached_num_finalized_computed_tokens = self._align_cacheable(
-                    num_finalized_computed_tokens
-                )
-                num_tokens_to_cache = min(
-                    num_finalized_computed_tokens,
-                    cached_num_finalized_computed_tokens + manager.block_size,
-                )
-            # The manager already knows the fine hit granularity
-            # (``scheduler_block_size``); retention is passed separately so it
-            # can keep both the coarse segment tails and the fine replay
-            # boundary (which needs the fine value).
             manager.cache_blocks(
                 request,
-                num_tokens_to_cache,
+                num_computed_tokens,
+                alignment_tokens=self.scheduler_block_size,
                 retention_interval=self.retention_interval,
             )
 

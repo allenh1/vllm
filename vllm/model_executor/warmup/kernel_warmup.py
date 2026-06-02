@@ -577,7 +577,15 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     flashinfer_sparse_mla_decode_autotune_warmup(worker)
     deepseek_v4_sparse_mla_attention_warmup(worker)
 
-    _deepseek_v4_sparse_mla_attention_warmup(worker)
+    if envs.VLLM_DEEPSEEK_V4_SPARSE_MLA_STATS_PATH:
+        from vllm.models.deepseek_v4.nvidia.flashmla import (
+            _disable_sparse_mla_prefill_stats,
+        )
+
+        with _disable_sparse_mla_prefill_stats():
+            _deepseek_v4_sparse_mla_attention_warmup(worker)
+    else:
+        _deepseek_v4_sparse_mla_attention_warmup(worker)
     _deepseek_v4_request_prep_warmup(worker)
 
     # Deep GEMM warmup

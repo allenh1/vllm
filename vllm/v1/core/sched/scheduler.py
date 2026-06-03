@@ -567,7 +567,7 @@ class Scheduler(SchedulerInterface):
         very_long_prefill_threshold = self._very_long_prefill_threshold()
         if has_decode_pressure:
             if remaining_prefill > very_long_prefill_threshold:
-                mixed_prefill_budget = max(1, self.max_num_scheduled_tokens // 16)
+                return 0
             else:
                 mixed_prefill_budget = max(1, self.max_num_scheduled_tokens // 4)
         elif remaining_prefill > very_long_prefill_threshold:
@@ -1093,7 +1093,8 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens = self._limit_mixed_decode_prefill_chunk(
                         request, num_new_tokens, scheduled_running_reqs
                     )
-                    assert num_new_tokens > 0
+                    if num_new_tokens == 0:
+                        break
 
                     # Apply Mamba alignment before encoder caps.
                     if self.need_mamba_block_aligned_split:

@@ -229,12 +229,18 @@ class KVCacheManager:
             preempted=request.num_preemptions > 0,
         )
 
-    def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int, int]:
+    def get_computed_blocks(
+        self,
+        request: Request,
+        *,
+        record_stats: bool = True,
+    ) -> tuple[KVCacheBlocks, int, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
 
         Args:
             request: The request to get the computed blocks.
+            record_stats: Whether to record prefix-cache stats for this lookup.
 
         Returns:
             A tuple containing:

@@ -130,6 +130,7 @@ class KVCacheManager:
         enable_kv_cache_events: bool = False,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
+        max_num_seqs: int | None = None,
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
     ) -> None:
@@ -161,6 +162,7 @@ class KVCacheManager:
             pcp_world_size=pcp_world_size,
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
+            max_num_seqs=max_num_seqs,
             metrics_collector=self.metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
         )

@@ -81,6 +81,7 @@ class KVCacheCoordinator(ABC):
         pcp_world_size: int,
         scheduler_block_size: int,
         hash_block_size: int,
+        max_num_seqs: int | None = None,
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
     ):
@@ -146,6 +147,7 @@ class KVCacheCoordinator(ABC):
                 pcp_world_size=pcp_world_size,
                 scheduler_block_size=self.scheduler_block_size,
                 needs_kv_cache_zeroing=self.kv_cache_config.needs_kv_cache_zeroing,
+                max_num_seqs=max_num_seqs,
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
@@ -452,6 +454,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
         pcp_world_size: int,
         scheduler_block_size: int,
         hash_block_size: int,
+        max_num_seqs: int | None = None,
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
     ):
@@ -466,6 +469,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
             pcp_world_size=pcp_world_size,
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
+            max_num_seqs=max_num_seqs,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
         )
@@ -504,6 +508,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         pcp_world_size: int,
         scheduler_block_size: int,
         hash_block_size: int,
+        max_num_seqs: int | None = None,
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
     ):
@@ -518,6 +523,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             pcp_world_size=pcp_world_size,
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
+            max_num_seqs=max_num_seqs,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
         )
@@ -591,6 +597,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         pcp_world_size: int,
         scheduler_block_size: int,
         hash_block_size: int,
+        max_num_seqs: int | None = None,
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
     ):
@@ -605,6 +612,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             pcp_world_size=pcp_world_size,
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
+            max_num_seqs=max_num_seqs,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
         )
@@ -936,6 +944,7 @@ def get_kv_cache_coordinator(
     pcp_world_size: int,
     scheduler_block_size: int,
     hash_block_size: int,
+    max_num_seqs: int | None = None,
     metrics_collector: KVCacheMetricsCollector | None = None,
     num_prefill_lookahead: int = 0,
 ) -> KVCacheCoordinator:
@@ -950,6 +959,7 @@ def get_kv_cache_coordinator(
             pcp_world_size=pcp_world_size,
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
+            max_num_seqs=max_num_seqs,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
         )
@@ -965,6 +975,7 @@ def get_kv_cache_coordinator(
             pcp_world_size=pcp_world_size,
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
+            max_num_seqs=max_num_seqs,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
         )
@@ -979,6 +990,7 @@ def get_kv_cache_coordinator(
         pcp_world_size=pcp_world_size,
         scheduler_block_size=scheduler_block_size,
         hash_block_size=hash_block_size,
+        max_num_seqs=max_num_seqs,
         metrics_collector=metrics_collector,
         num_prefill_lookahead=num_prefill_lookahead,
     )

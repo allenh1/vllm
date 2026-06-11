@@ -55,6 +55,25 @@ def test_p2p_side_channel_defaults_and_override(monkeypatch: pytest.MonkeyPatch)
     assert envs.VLLM_P2P_SIDE_CHANNEL_PORT == 5799
 
 
+def test_deepseek_v4_sparse_mla_stats_path_env(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("VLLM_DEEPSEEK_V4_SPARSE_MLA_STATS_PATH", raising=False)
+    if hasattr(envs.__getattr__, "cache_clear"):
+        envs.__getattr__.cache_clear()
+
+    assert envs.VLLM_DEEPSEEK_V4_SPARSE_MLA_STATS_PATH is None
+
+    monkeypatch.setenv(
+        "VLLM_DEEPSEEK_V4_SPARSE_MLA_STATS_PATH",
+        "/tmp/sparse_mla_stats",
+    )
+    if hasattr(envs.__getattr__, "cache_clear"):
+        envs.__getattr__.cache_clear()
+
+    assert envs.VLLM_DEEPSEEK_V4_SPARSE_MLA_STATS_PATH == "/tmp/sparse_mla_stats"
+
+
 def test_getattr_with_cache(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_HOST_IP", "1.1.1.1")
     monkeypatch.setenv("VLLM_PORT", "1234")

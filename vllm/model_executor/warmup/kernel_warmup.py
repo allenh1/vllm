@@ -421,7 +421,6 @@ def _deepseek_v4_indexed_d512_split_prefill_warmup(runner: "GPUModelRunner") -> 
         )
         from vllm.models.deepseek_v4.nvidia.flashmla import (
             _INDEXED_D512_SPLIT_PREFILL_MAX_TOPK,
-            _INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS,
             _INDEXED_D512_SPLIT_PREFILL_MIN_TOPK,
             DeepseekV4FlashMLAAttention,
         )
@@ -442,7 +441,10 @@ def _deepseek_v4_indexed_d512_split_prefill_warmup(runner: "GPUModelRunner") -> 
     try:
         if not is_triton_sparse_mla_enabled_for_platform():
             return
-        if getattr(runner, "max_model_len", 0) < _INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS:
+        if (
+            getattr(runner, "max_model_len", 0)
+            < envs.VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS
+        ):
             return
 
         # The split kernel never sees compress_ratio, so any cr in (4, 128)

@@ -5,7 +5,9 @@ from typing import ClassVar, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.warmup.jit_warmup import (
     VllmJitKernel,
@@ -36,6 +38,8 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     get_kv_quant_mode,
 )
+
+logger = init_logger(__name__)
 
 # DeepseekV4 decode layer types, keyed by compress_ratio. Each type has a distinct
 # (topk, extra_topk, extra_page_block_size) config, so they cannot share a
@@ -164,7 +168,11 @@ class DeepseekSparseSWAMetadata:
     decode_swa_lens: torch.Tensor | None = None  # [num_decode_tokens]
     # window_size (causal) or noncausal_index_width (DSpark non-causal).
     decode_swa_width: int = 0
-    # Paged-coordinate prefill SWA indices/lens (FP8 paged-direct prefill).
+    # Prefill SWA window indices. In the FlashInfer SM120 packed-prefill case they
+    # are hoisted once-per-step by the builder as views of the decode_swa_* buffers
+    # over the prefill token range [num_decode_tokens:num_tokens]; otherwise they are
+    # the per-token paged-coordinate prefill buffers (FP8 paged-direct prefill).
+    # None when there is nothing to compute -> the layer self-computes when needed.
     prefill_swa_indices: torch.Tensor | None = (
         None  # [num_prefill_tokens, 1, window_size]
     )
@@ -523,23 +531,23 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         decode_swa_width = (
             self.noncausal_index_width if non_causal else self.window_size
         )
-        decode_swa_indices = self.decode_swa_indices
-        if num_decode_tokens > 0:
-            self.decode_swa_lens[num_decode_tokens:] = 0
-            if non_causal:
-                assert self.is_dspark, (
-                    "Non-causal DeepseekV4 SWA is only supported for the DSpark "
-                    "speculation mode, but causal=False was set without DSpark."
+        num_tokens = num_decode_tokens + num_prefill_tokens
+        if non_causal:
+            assert self.is_dspark, (
+                "Non-causal DeepseekV4 SWA is only supported for the DSpark "
+                "speculation mode, but causal=False was set without DSpark."
+            )
+            if self.decode_swa_indices_noncausal is None:
+                self.decode_swa_indices_noncausal = torch.zeros(
+                    self._max_tokens,
+                    1,
+                    self.noncausal_index_width,
+                    dtype=torch.int32,
+                    device=self.device,
                 )
-                if self.decode_swa_indices_noncausal is None:
-                    self.decode_swa_indices_noncausal = torch.zeros(
-                        self._max_tokens,
-                        1,
-                        self.noncausal_index_width,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
-                decode_swa_indices = self.decode_swa_indices_noncausal
+            decode_swa_indices = self.decode_swa_indices_noncausal
+            if num_decode_tokens > 0:
+                self.decode_swa_lens[num_decode_tokens:] = 0
                 _compute_dspark_noncausal_swa_indices_kernel[(num_decode_tokens,)](
                     decode_swa_indices,
                     decode_swa_indices.stride(0),
@@ -556,10 +564,41 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                     token_offset=0,
                     TRITON_BLOCK_SIZE=1024,
                 )
-            else:
-                _compute_swa_indices_and_lens_kernel[(num_decode_tokens,)](
-                    decode_swa_indices,
-                    decode_swa_indices.stride(0),
+            # Noncausal keeps the per-token paged-coordinate prefill buffers.
+            want_prefill_swa = False
+        else:
+            # SWA window indices are keyed by the GLOBAL token index, so a single
+            # launch over [0, swa_total_tokens) fills the decode rows and -- when the
+            # FlashInfer SM120 packed-prefill feature is active -- the prefill rows
+            # too, hoisting the per-token SWA compute out of the per-layer
+            # _forward_prefill (~60x/step) into this once-per-step build().
+            # decode_swa_* are sized max_num_batched_tokens, so num_tokens fits.
+            # Gate the prefill widening conservatively; the predicate short-circuits
+            # left-to-right so the is_valid_token.any() device sync runs ONLY when the
+            # feature is on, there are prefill tokens, and we are not in CUDA-graph
+            # capture (the sync is illegal during capture). The warmup/profile
+            # prefill dummy fills slot_mapping with -1, so is_valid_token over the
+            # prefill tail is all-False -> .any() is False -> the widened launch is
+            # skipped (this is the exact OOB that hung the earlier metadata attempt).
+            want_prefill_swa = (
+                envs.VLLM_DEEPSEEK_V4_FLASHINFER_SM120_PREFILL
+                and num_prefill_tokens > 0
+                and not torch.cuda.is_current_stream_capturing()
+                and bool(is_valid_token[num_decode_tokens:num_tokens].any())
+            )
+            decode_swa_indices = self.decode_swa_indices
+            swa_total_tokens = num_tokens if want_prefill_swa else num_decode_tokens
+            if want_prefill_swa:
+                logger.info_once(
+                    "DeepSeek V4 SM120: prefill SWA window indices hoisted into "
+                    "the metadata builder (once per step, replacing per-layer "
+                    "recompute)."
+                )
+            if swa_total_tokens > 0:
+                self.decode_swa_lens[swa_total_tokens:] = 0
+                _compute_swa_indices_and_lens_kernel[(swa_total_tokens,)](
+                    self.decode_swa_indices,
+                    self.decode_swa_indices.stride(0),
                     self.decode_swa_lens,
                     self.window_size,
                     query_start_loc,
@@ -569,20 +608,17 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                     block_table,
                     block_table.stride(0),
                     self.block_size,
-                    token_offset=0,
+                    token_offset=num_decode_tokens,
                     TRITON_BLOCK_SIZE=1024,
                 )
-
         # Prefill SWA indices live in paged coordinates. `token_offset` lets
         # the kernel read is_valid_token / token_to_req_indices at absolute
         # prefill positions while writing output starting at index 0.
-        if num_prefill_tokens > 0:
-            prefill_swa_indices = self.prefill_swa_indices[:num_prefill_tokens]
-            prefill_swa_lens = self.prefill_swa_lens[:num_prefill_tokens]
+        if num_prefill_tokens > 0 and not want_prefill_swa:
             _compute_swa_indices_and_lens_kernel[(num_prefill_tokens,)](
-                prefill_swa_indices,
-                prefill_swa_indices.stride(0),
-                prefill_swa_lens,
+                self.prefill_swa_indices[:num_prefill_tokens],
+                self.prefill_swa_indices.stride(0),
+                self.prefill_swa_lens[:num_prefill_tokens],
                 self.window_size,
                 query_start_loc,
                 seq_lens,
@@ -623,14 +659,22 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             decode_swa_lens=self.decode_swa_lens[:num_decode_tokens],
             decode_swa_width=decode_swa_width,
             prefill_swa_indices=(
-                self.prefill_swa_indices[:num_prefill_tokens]
-                if num_prefill_tokens > 0
-                else None
+                self.decode_swa_indices[num_decode_tokens:num_tokens]
+                if want_prefill_swa
+                else (
+                    self.prefill_swa_indices[:num_prefill_tokens]
+                    if num_prefill_tokens > 0
+                    else None
+                )
             ),
             prefill_swa_lens=(
-                self.prefill_swa_lens[:num_prefill_tokens]
-                if num_prefill_tokens > 0
-                else None
+                self.decode_swa_lens[num_decode_tokens:num_tokens]
+                if want_prefill_swa
+                else (
+                    self.prefill_swa_lens[:num_prefill_tokens]
+                    if num_prefill_tokens > 0
+                    else None
+                )
             ),
             block_size=self.block_size,
             num_decodes=num_decodes,

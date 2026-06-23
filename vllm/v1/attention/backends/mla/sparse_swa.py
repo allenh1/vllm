@@ -537,6 +537,12 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 "Non-causal DeepseekV4 SWA is only supported for the DSpark "
                 "speculation mode, but causal=False was set without DSpark."
             )
+        non_causal = not common_attn_metadata.causal
+        if non_causal:
+            assert self.is_dspark, (
+                "Non-causal DeepseekV4 SWA is only supported for the DSpark "
+                "speculation mode, but causal=False was set without DSpark."
+            )
             if self.decode_swa_indices_noncausal is None:
                 self.decode_swa_indices_noncausal = torch.zeros(
                     self._max_tokens,
@@ -564,39 +570,12 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                     token_offset=0,
                     TRITON_BLOCK_SIZE=1024,
                 )
-            # Noncausal keeps the per-token paged-coordinate prefill buffers.
             want_prefill_swa = False
         else:
-            # SWA window indices are keyed by the GLOBAL token index, so a single
-            # launch over [0, swa_total_tokens) fills the decode rows and -- when the
-            # FlashInfer SM120 packed-prefill feature is active -- the prefill rows
-            # too, hoisting the per-token SWA compute out of the per-layer
-            # _forward_prefill (~60x/step) into this once-per-step build().
-            # decode_swa_* are sized max_num_batched_tokens, so num_tokens fits.
-            # Gate the prefill widening conservatively; the predicate short-circuits
-            # left-to-right so the is_valid_token.any() device sync runs ONLY when the
-            # feature is on, there are prefill tokens, and we are not in CUDA-graph
-            # capture (the sync is illegal during capture). The warmup/profile
-            # prefill dummy fills slot_mapping with -1, so is_valid_token over the
-            # prefill tail is all-False -> .any() is False -> the widened launch is
-            # skipped (this is the exact OOB that hung the earlier metadata attempt).
-            want_prefill_swa = (
-                envs.VLLM_DEEPSEEK_V4_FLASHINFER_SM120_PREFILL
-                and num_prefill_tokens > 0
-                and not torch.cuda.is_current_stream_capturing()
-                and bool(is_valid_token[num_decode_tokens:num_tokens].any())
-            )
-            decode_swa_indices = self.decode_swa_indices
-            swa_total_tokens = num_tokens if want_prefill_swa else num_decode_tokens
-            if want_prefill_swa:
-                logger.info_once(
-                    "DeepSeek V4 SM120: prefill SWA window indices hoisted into "
-                    "the metadata builder (once per step, replacing per-layer "
-                    "recompute)."
-                )
-            if swa_total_tokens > 0:
-                self.decode_swa_lens[swa_total_tokens:] = 0
-                _compute_swa_indices_and_lens_kernel[(swa_total_tokens,)](
+            # Compute SWA window indices/lens for the decode rows once per step.
+            if num_decode_tokens > 0:
+                self.decode_swa_lens[num_decode_tokens:] = 0
+                _compute_swa_indices_and_lens_kernel[(num_decode_tokens,)](
                     self.decode_swa_indices,
                     self.decode_swa_indices.stride(0),
                     self.decode_swa_lens,
@@ -608,13 +587,39 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                     block_table,
                     block_table.stride(0),
                     self.block_size,
-                    token_offset=num_decode_tokens,
+                    token_offset=0,
                     TRITON_BLOCK_SIZE=1024,
                 )
-        # Prefill SWA indices live in paged coordinates. `token_offset` lets
-        # the kernel read is_valid_token / token_to_req_indices at absolute
-        # prefill positions while writing output starting at index 0.
-        if num_prefill_tokens > 0 and not want_prefill_swa:
+            # Prefill SWA indices (paged coords; `token_offset` lets the kernel
+            # read at absolute prefill positions while writing from index 0) are
+            # consumed ONLY by the FlashInfer SM120 sparse-MLA fork path. The stock
+            # FlashMLA/Triton prefill self-computes and never reads them, so gate the
+            # launch behind VLLM_DEEPSEEK_V4_FLASHINFER_SM120_PREFILL (default
+            # off). Running it unconditionally faulted
+            # `_compute_swa_indices_and_lens_kernel` over 32k prefill rows
+            # (unclamped block_table address arithmetic on masked-off lanes ->
+            # cudaErrorLaunchFailure under concurrent load).
+            want_prefill_swa = (
+                num_prefill_tokens > 0
+                and envs.VLLM_DEEPSEEK_V4_FLASHINFER_SM120_PREFILL
+            )
+            decode_swa_indices = self.decode_swa_indices
+        if want_prefill_swa or (non_causal and num_prefill_tokens > 0):
+            _compute_swa_indices_and_lens_kernel[(num_prefill_tokens,)](
+                self.prefill_swa_indices[:num_prefill_tokens],
+                self.prefill_swa_indices.stride(0),
+                self.prefill_swa_lens[:num_prefill_tokens],
+                self.window_size,
+                query_start_loc,
+                seq_lens,
+                token_to_req_indices,
+                is_valid_token,
+                block_table,
+                block_table.stride(0),
+                self.block_size,
+                token_offset=num_decode_tokens,
+                TRITON_BLOCK_SIZE=1024,
+            )
             _compute_swa_indices_and_lens_kernel[(num_prefill_tokens,)](
                 self.prefill_swa_indices[:num_prefill_tokens],
                 self.prefill_swa_indices.stride(0),
@@ -659,22 +664,14 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             decode_swa_lens=self.decode_swa_lens[:num_decode_tokens],
             decode_swa_width=decode_swa_width,
             prefill_swa_indices=(
-                self.decode_swa_indices[num_decode_tokens:num_tokens]
-                if want_prefill_swa
-                else (
-                    self.prefill_swa_indices[:num_prefill_tokens]
-                    if num_prefill_tokens > 0
-                    else None
-                )
+                self.prefill_swa_indices[:num_prefill_tokens]
+                if want_prefill_swa or (non_causal and num_prefill_tokens > 0)
+                else None
             ),
             prefill_swa_lens=(
-                self.decode_swa_lens[num_decode_tokens:num_tokens]
-                if want_prefill_swa
-                else (
-                    self.prefill_swa_lens[:num_prefill_tokens]
-                    if num_prefill_tokens > 0
-                    else None
-                )
+                self.prefill_swa_lens[:num_prefill_tokens]
+                if want_prefill_swa or (non_causal and num_prefill_tokens > 0)
+                else None
             ),
             block_size=self.block_size,
             num_decodes=num_decodes,
@@ -876,8 +873,14 @@ def _compute_swa_indices_and_lens_kernel(
 
         pos_offset = start_pos + offset
         block_indices = pos_offset // block_size
+        # Clamp masked-off lanes before the address add: SM12x + Triton 3.6 raises
+        # IMA on out-of-bounds address arithmetic even when the load mask gates the
+        # read (same hazard the sibling _compute_prefill_metadata_kernel clamps via
+        # safe_offset). Over a deep prefill row the tail lanes index past the
+        # request's block_table row -> cudaErrorLaunchFailure without this.
+        safe_block_indices = tl.where(pos_offset < end_pos, block_indices, 0)
         block_numbers = tl.load(
-            block_table_ptr + req_idx * block_table_stride + block_indices,
+            block_table_ptr + req_idx * block_table_stride + safe_block_indices,
             mask=pos_offset < end_pos,
         )
         block_offsets = pos_offset % block_size

@@ -16,6 +16,7 @@ from vllm.model_executor.warmup.jit_warmup import (
 from vllm.model_executor.warmup.jit_warmup_triton_helper import TritonWarmupTensor
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.flashinfer import is_dsv4_sm120_fi_prefill_active
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -601,25 +602,11 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             # cudaErrorLaunchFailure under concurrent load).
             want_prefill_swa = (
                 num_prefill_tokens > 0
+                and is_dsv4_sm120_fi_prefill_active()
                 and envs.VLLM_DEEPSEEK_V4_FLASHINFER_SM120_PREFILL
             )
             decode_swa_indices = self.decode_swa_indices
         if want_prefill_swa or (non_causal and num_prefill_tokens > 0):
-            _compute_swa_indices_and_lens_kernel[(num_prefill_tokens,)](
-                self.prefill_swa_indices[:num_prefill_tokens],
-                self.prefill_swa_indices.stride(0),
-                self.prefill_swa_lens[:num_prefill_tokens],
-                self.window_size,
-                query_start_loc,
-                seq_lens,
-                token_to_req_indices,
-                is_valid_token,
-                block_table,
-                block_table.stride(0),
-                self.block_size,
-                token_offset=num_decode_tokens,
-                TRITON_BLOCK_SIZE=1024,
-            )
             _compute_swa_indices_and_lens_kernel[(num_prefill_tokens,)](
                 self.prefill_swa_indices[:num_prefill_tokens],
                 self.prefill_swa_indices.stride(0),

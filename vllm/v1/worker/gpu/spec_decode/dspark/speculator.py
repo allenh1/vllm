@@ -41,7 +41,13 @@ class DSparkSpeculator(DFlashSpeculator):
     _speculator_name = "DSpark"
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        super().__init__(vllm_config, device)
+        # DSpark only stores the combined main_x hidden state, not the
+        # HC-multiplexed aux hidden state used by DFlash.
+        assert vllm_config.speculative_config is not None
+        draft_hidden = (
+            vllm_config.speculative_config.draft_model_config.get_hidden_size()
+        )
+        super().__init__(vllm_config, device, hidden_states_size=draft_hidden)
 
         # Whether to sample from the anchor position. When True, uses anchor-as-first
         # (N slots, each position predicts the next token). When False, uses 1+N
@@ -53,15 +59,6 @@ class DSparkSpeculator(DFlashSpeculator):
             self.num_query_per_req = self.num_speculative_steps
         else:
             self.num_query_per_req = 1 + self.num_speculative_steps
-
-        # DSpark consumes mean-pooled target aux hidden states at the target
-        # layers, combined to hidden_size via main_proj. Store that combined
-        # main_x (hidden_size wide). DSpark does not use the same pre-allocated buffer
-        # that DeepSeek-V4's MTP uses.
-        draft_hidden = self.draft_model_config.get_hidden_size()
-        self.hidden_states = torch.zeros(
-            self.max_num_tokens, draft_hidden, dtype=self.dtype, device=device
-        )
 
         self._step_cols = torch.arange(
             self.num_speculative_steps, dtype=torch.int32, device=device

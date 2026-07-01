@@ -643,6 +643,7 @@ _SPECULATIVE_DECODING_MODELS = {
     "Dots3NoteMTPModel": ("vllm.models.dots3_note", "Dots3NoteMTP"),
     "DeepSeekV4MTPModel": ("vllm.models.deepseek_v4", "DeepSeekV4MTP"),
     "BailingMoeV3MTPModel": ("bailing_moe_v3_mtp", "BailingMoeV3MTPModel"),
+    "DeepSeekV4DSparkModel": ("vllm.models.deepseek_v4", "DeepSeekV4DSpark"),
     "MiniMaxM3MTP": ("vllm.models.minimax_m3", "MiniMaxM3MTP"),
     "BailingMoeV25MTPModel": ("bailing_moe_mtp", "BailingMoeV25MTPModel"),
     "InklingMTPModel": ("vllm.models.inkling", "InklingMTP"),

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import typing
 from collections.abc import Callable, Iterable
 from inspect import signature
@@ -17,6 +18,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import get_forward_context, is_forward_context_available
@@ -51,6 +53,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
@@ -82,6 +85,9 @@ from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
 )
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
+from vllm.models.deepseek_v4.nvidia.ops.shared_experts import (
+    dspark_silu_mul_clamp_fp8_quant,
+)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils import deep_gemm
@@ -96,6 +102,21 @@ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 logger = init_logger(__name__)
 
 
+def _env_bool(name: str) -> bool:
+    return os.getenv(name, "").lower() in ("1", "true", "yes", "on")
+
+
+def _dspark_config_bool(vllm_config: VllmConfig, attr: str, env_name: str) -> bool:
+    spec_config = vllm_config.speculative_config
+    return bool(getattr(spec_config, attr, False)) or _env_bool(env_name)
+
+
+def _dspark_linear_scale(layer: nn.Module) -> torch.Tensor | None:
+    scale = getattr(layer, "weight_scale_inv", None)
+    if scale is None:
+        scale = getattr(layer, "weight_scale", None)
+    return scale
+
 class DeepseekV4MLP(nn.Module):
     def __init__(
         self,
@@ -106,9 +127,11 @@ class DeepseekV4MLP(nn.Module):
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         is_sequence_parallel: bool = False,
+        dspark_fused_shared_experts_quant: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.prefix = prefix
 
         # If is_sequence_parallel, the input and output tensors are sharded
         # across the ranks within the tp_group. In this case the weights are
@@ -148,12 +171,81 @@ class DeepseekV4MLP(nn.Module):
             self.act_fn = SiluAndMulWithClamp(swiglu_limit)
         else:
             self.act_fn = SiluAndMul()
+        self._dspark_fused_shared_experts_quant_enabled = (
+            dspark_fused_shared_experts_quant
+        )
+
+    def _forward_dspark_fused_shared_experts_quant(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """gate_up GEMM -> fused (clamp+silu+mul+FP8-quant) -> down GEMM.
+
+        Eliminates the standalone ``per_token_group_quant_fp8`` kernel that
+        down_proj's block-scaled-mm input quantization launches right after
+        ``self.act_fn`` writes its BF16 output (see
+        ``ops/shared_experts.py``). Returns ``None`` on any unsupported
+        config so the caller falls back to the default unfused path.
+        """
+        if not isinstance(self.act_fn, (SiluAndMul, SiluAndMulWithClamp)):
+            return None
+        quant_method = getattr(self.down_proj, "quant_method", None)
+        kernel = getattr(quant_method, "w8a8_block_fp8_linear", None) or getattr(
+            quant_method, "fp8_linear", None
+        )
+        if kernel is None or not hasattr(kernel, "apply_block_scaled_mm"):
+            return None
+        down_weight = getattr(self.down_proj, "weight", None)
+        down_scale = _dspark_linear_scale(self.down_proj)
+        if down_weight is None or down_scale is None:
+            return None
+
+        gate_up, _ = self.gate_up_proj(x)
+
+        num_tokens = gate_up.shape[0]
+        d = gate_up.shape[-1] // 2
+        if d % 128 != 0:
+            return None
+        out_fp8 = torch.empty(
+            (num_tokens, d), dtype=torch.float8_e4m3fn, device=gate_up.device
+        )
+        out_scale = torch.empty(
+            (num_tokens, d // 128), dtype=torch.float32, device=gate_up.device
+        )
+        swiglu_limit = getattr(self.act_fn, "swiglu_limit", None)
+        alpha = getattr(self.act_fn, "alpha", 1.0)
+        beta = getattr(self.act_fn, "beta", 0.0)
+
+        dspark_silu_mul_clamp_fp8_quant(
+            gate_up, swiglu_limit, alpha, beta, out_fp8, out_scale
+        )
+        output = kernel.apply_block_scaled_mm(
+            A=out_fp8, B=down_weight, As=out_scale, Bs=down_scale
+        )
+        if (
+            get_tensor_model_parallel_world_size() > 1
+            and self.down_proj.reduce_results
+        ):
+            output = tensor_model_parallel_all_reduce(output)
+        logger.info_once(
+            "DSpark fused shared-expert activation+quant engaged: "
+            "out_fp8 shape=%s scale shape=%s",
+            tuple(out_fp8.shape),
+            tuple(out_scale.shape),
+        )
+        return output
 
     def forward(self, x):
+        if self._dspark_fused_shared_experts_quant_enabled:
+            output = self._forward_dspark_fused_shared_experts_quant(x)
+            if output is not None:
+                return output
+
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
+        activated = self.act_fn(gate_up)
+        output, _ = self.down_proj(activated)
+        return output
+
 
 
 def make_deepseek_v4_expert_params_mapping(
@@ -194,7 +286,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
     ):
         super().__init__()
         self.prefix = prefix
-        self.capture_fn: Callable[[torch.Tensor], None] | None = None
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
         self.experts_start_idx = experts_start_idx
@@ -626,10 +717,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
     def update_expert_map(self) -> None:
         pass
 
-    @property
-    def layer_id(self) -> int:
-        return extract_layer_index(self.prefix)
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -653,9 +740,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             is_padding = get_forward_context().is_padding
             if is_padding is not None:
                 is_padding = is_padding[:num_tokens]
-
-        if self.capture_fn is not None:
-            self.capture_fn(topk_ids)
 
         # EPLB: map logical expert IDs to physical replicas and record load.
         eplb_state = self.eplb_state
@@ -750,6 +834,13 @@ class DeepseekV4MoE(nn.Module):
         validate_fi_moe_ep_config(vllm_config)
         self.use_mega_moe = moe_backend in MEGA_MOE_BACKENDS
         self.use_fi_mega_moe = is_fi_moe_ep_backend(moe_backend)
+        self._layer_idx = extract_layer_index(prefix)
+        self._is_dspark_runtime_layer = self._layer_idx >= config.num_hidden_layers
+        self._dspark_fused_shared_experts_quant = _dspark_config_bool(
+            vllm_config,
+            "dspark_fused_shared_experts_quant",
+            "VLLM_DSPARK_FUSED_SHARED_EXPERTS_QUANT",
+        )
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
                 "DeepSeek V4 MegaMoE currently requires expert parallel. "
@@ -821,6 +912,10 @@ class DeepseekV4MoE(nn.Module):
                 quant_config=quant_config,
                 reduce_results=self.use_mega_moe,
                 is_sequence_parallel=use_sequence_parallel,
+                dspark_fused_shared_experts_quant=(
+                    self._dspark_fused_shared_experts_quant
+                    and self._is_dspark_runtime_layer
+                ),
                 prefix=f"{prefix}.shared_experts",
             )
 
@@ -1031,11 +1126,19 @@ class DeepseekV4MoE(nn.Module):
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
     ) -> torch.Tensor:
         org_shape = hidden_states.shape
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            router_logits=hidden_states,
-            input_ids=input_ids,
-        )
+        if self.experts.is_internal_router:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                router_logits=hidden_states,
+                input_ids=input_ids,
+            )
+        else:
+            router_logits, _ = self.gate(hidden_states)
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                input_ids=input_ids,
+            )
 
         return final_hidden_states.view(org_shape)
 
@@ -1383,6 +1486,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
         else:
             self._mtp_hidden_buffer = None
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1853,6 +1957,13 @@ class DeepseekV4ForCausalLM(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
         return hidden_states
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = layers
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         """Pre-hc_head residual stream buffer (max_num_batched_tokens,

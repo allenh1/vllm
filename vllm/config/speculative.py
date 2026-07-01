@@ -3,6 +3,7 @@
 
 import copy
 import functools
+import os
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
@@ -34,6 +35,10 @@ else:
 
 logger = init_logger(__name__)
 
+
+def _env_bool(name: str) -> bool:
+    return os.getenv(name, "").lower() in ("1", "true", "yes", "on")
+
 MTPModelTypes = Literal[
     "deepseek_mtp",
     "dots3_note_mtp",
@@ -64,7 +69,12 @@ NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
 DSparkModelTypes = Literal["dspark"]
 EagleModelTypes = Literal[
-    "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
+    "eagle",
+    "eagle3",
+    "extract_hidden_states",
+    MTPModelTypes,
+    DFlashModelTypes,
+    DSparkModelTypes,
 ]
 SpeculativeMethod = Literal[
     "ngram",
@@ -585,6 +595,46 @@ class SpeculativeConfig:
     dspark_draft_topk: int | None = Field(default=None, ge=1)
     """For Qwen3 DSpark drafting, evaluate the Markov projection only for the
     top-k base-logit candidates. Requires draft tensor parallel size 1."""
+    dspark_materialized_attention: bool = Field(
+        default_factory=lambda: _env_bool("VLLM_DSPARK_MATERIALIZED_ATTENTION")
+    )
+    """DSpark-only opt-in for the materialized local attention path."""
+    dspark_triton_attention: bool = Field(
+        default_factory=lambda: _env_bool("VLLM_DSPARK_TRITON_ATTENTION")
+    )
+    """DSpark-only opt-in for the Triton materialized attention path."""
+    dspark_triton_qkv_postprocess: bool = Field(
+        default_factory=lambda: _env_bool("VLLM_DSPARK_TRITON_QKV_POSTPROCESS")
+    )
+    """DSpark-only opt-in for fused QKV postprocessing."""
+    dspark_triton_context_kv_store: bool = Field(
+        default_factory=lambda: _env_bool("VLLM_DSPARK_TRITON_CONTEXT_KV_STORE")
+    )
+    """DSpark-only opt-in for Triton context KV stores."""
+    dspark_markov_inplace_add: bool = Field(
+        default_factory=lambda: _env_bool("VLLM_DSPARK_MARKOV_INPLACE_ADD")
+    )
+    """DSpark-only opt-in for in-place Markov residual adds."""
+    dspark_fused_markov_sampler: bool = Field(
+        default_factory=lambda: _env_bool("VLLM_DSPARK_FUSED_MARKOV_SAMPLER")
+    )
+    """DSpark-only opt-in for fused probabilistic Markov sampling."""
+    dspark_forward_cudagraph: bool = Field(
+        default_factory=lambda: _env_bool("VLLM_DSPARK_FORWARD_CUDAGRAPH")
+    )
+    """DSpark-only opt-in for the draft forward CUDA graph prototype."""
+    dspark_forward_cudagraph_allow_tp: bool = Field(
+        default_factory=lambda: _env_bool("VLLM_DSPARK_FORWARD_CUDAGRAPH_ALLOW_TP")
+    )
+    """Allow the DSpark draft forward CUDA graph under tensor parallelism."""
+    dspark_fused_o_proj_quant: bool = Field(
+        default_factory=lambda: _env_bool("VLLM_DSPARK_FUSED_O_PROJ_QUANT")
+    )
+    """DSpark-only opt-in for fused output-projection activation quantization."""
+    dspark_fused_shared_experts_quant: bool = Field(
+        default_factory=lambda: _env_bool("VLLM_DSPARK_FUSED_SHARED_EXPERTS_QUANT")
+    )
+    """DSpark-only opt-in for fused shared-expert activation quantization."""
 
     def compute_hash(self) -> str:
         """
@@ -618,9 +668,30 @@ class SpeculativeConfig:
                 "eagle_aux_hidden_state_layer_ids",
                 None,
             )
+            if layer_ids is None:
+                layer_ids = getattr(
+                    self.draft_model_config.hf_config,
+                    "dspark_target_layer_ids",
+                    None,
+                )
             if layer_ids is not None:
                 # Convert to tuple to make it hashable
                 factors.append(tuple(layer_ids))
+        if self.method == "dspark":
+            factors.append(
+                (
+                    self.dspark_materialized_attention,
+                    self.dspark_triton_attention,
+                    self.dspark_triton_qkv_postprocess,
+                    self.dspark_triton_context_kv_store,
+                    self.dspark_markov_inplace_add,
+                    self.dspark_fused_markov_sampler,
+                    self.dspark_forward_cudagraph,
+                    self.dspark_forward_cudagraph_allow_tp,
+                    self.dspark_fused_o_proj_quant,
+                    self.dspark_fused_shared_experts_quant,
+                )
+            )
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
@@ -1254,9 +1325,10 @@ class SpeculativeConfig:
                     or _QWEN3_OMNI_DSPARK_ARCHITECTURE
                     in self.draft_model_config.architectures
                     or "Gemma4DSparkModel" in self.draft_model_config.architectures
-                    or (
-                        "DSparkDraftModel" in self.draft_model_config.architectures
-                        and self.draft_model_config.hf_config.model_type == "qwen3"
+                    or getattr(
+                        self.draft_model_config.hf_config,
+                        "dspark_block_size",
+                        0,
                     )
                 ):
                     self.method = "dspark"
@@ -1315,51 +1387,46 @@ class SpeculativeConfig:
                         self.draft_model_config.hf_config = eagle_config
                         self.update_arch_()
 
-                if (
-                    self.method == "dspark"
-                    and "DSparkDraftModel" in self.draft_model_config.architectures
-                    and self.draft_model_config.hf_config.model_type == "qwen3"
-                ):
-                    self.draft_model_config.hf_config.architectures = [
+                if self.method == "dspark":
+                    self.parallel_drafting = True
+                    if self.num_speculative_tokens is None:
+                        self.num_speculative_tokens = getattr(
+                            self.draft_model_config.hf_config,
+                            "dspark_block_size",
+                            None,
+                        )
+                    if (
                         "Qwen3DSparkModel"
-                    ]
-                    self.update_arch_()
-                elif self.method == "dspark" and (
-                    "Qwen3DSparkModel" not in self.draft_model_config.architectures
-                    and _QWEN3_OMNI_DSPARK_ARCHITECTURE
-                    not in self.draft_model_config.architectures
-                    and "Gemma4DSparkModel" not in self.draft_model_config.architectures
-                    and "K3DSparkModel" not in self.draft_model_config.architectures
-                ):
-                    # DeepSeek-V4 DSpark reuses the full DeepSeek-V4 config
-                    # and its weights ship in the target checkpoint.
-                    self.draft_model_config.hf_config.model_type = "deepseek_v4"
-                    self.draft_model_config.hf_config.architectures = [
-                        "DSparkDraftModel"
-                    ]
-                    self.draft_model_config.quantization = (
-                        self.target_model_config.quantization
-                    )
-                    self.update_arch_()
-                elif (
-                    self.method == "dspark"
-                    and "Gemma4DSparkModel" in self.draft_model_config.architectures
-                ):
-                    # Normalize the self-contained Gemma4 draft's config keys to
-                    # the DSpark conventions.
-                    hf = self.draft_model_config.hf_config
-                    if (
-                        getattr(hf, "dspark_target_layer_ids", None) is None
-                        and getattr(hf, "target_layer_ids", None) is not None
+                        not in self.draft_model_config.architectures
+                        and "Gemma4DSparkModel"
+                        not in self.draft_model_config.architectures
+                        and "K3DSparkModel" not in self.draft_model_config.architectures
                     ):
-                        hf.dspark_target_layer_ids = hf.target_layer_ids
-                    if (
-                        getattr(hf, "n_predict", None) is None
-                        and getattr(hf, "block_size", None) is not None
+                        # DeepSeek-V4 DSpark reuses the full DeepSeek-V4 config
+                        # and its weights ship in the target checkpoint.
+                        self.draft_model_config.hf_config.model_type = "deepseek_v4"
+                        self.draft_model_config.hf_config.architectures = [
+                            "DeepSeekV4DSparkModel"
+                        ]
+                        self.update_arch_()
+                    elif (
+                        self.method == "dspark"
+                        and "Gemma4DSparkModel" in self.draft_model_config.architectures
                     ):
-                        hf.n_predict = hf.block_size
-
-                if self.method in ("dflash", "dspark"):
+                        # Normalize the self-contained Gemma4 draft's config keys to
+                        # the DSpark conventions.
+                        hf = self.draft_model_config.hf_config
+                        if (
+                            getattr(hf, "dspark_target_layer_ids", None) is None
+                            and getattr(hf, "target_layer_ids", None) is not None
+                        ):
+                            hf.dspark_target_layer_ids = hf.target_layer_ids
+                        if (
+                            getattr(hf, "n_predict", None) is None
+                            and getattr(hf, "block_size", None) is not None
+                        ):
+                            hf.n_predict = hf.block_size
+                elif self.method == "dflash":
                     self.parallel_drafting = True
 
                 if self.num_speculative_tokens is not None and hasattr(

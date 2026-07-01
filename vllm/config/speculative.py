@@ -609,9 +609,7 @@ class SpeculativeConfig:
     )
     """DSpark-only opt-in for the draft forward CUDA graph prototype."""
     dspark_forward_cudagraph_allow_tp: bool = Field(
-        default_factory=lambda: envs.env_bool(
-            "VLLM_DSPARK_FORWARD_CUDAGRAPH_ALLOW_TP"
-        )
+        default_factory=lambda: envs.env_bool("VLLM_DSPARK_FORWARD_CUDAGRAPH_ALLOW_TP")
     )
     """Allow the DSpark draft forward CUDA graph under tensor parallelism."""
     dspark_fused_o_proj_quant: bool = True

@@ -31,6 +31,20 @@ def _resolve_dspark_attention_backend(
     return None
 
 
+def _inner_model(model: nn.Module) -> nn.Module:
+    return getattr(model, "model", model)
+
+
+def _find_module_attr(
+    model: nn.Module, *names: str
+) -> tuple[nn.Module, str, nn.Module | None]:
+    for name in names:
+        value = getattr(model, name, None)
+        if value is not None:
+            return model, name, value
+    return model, names[0], None
+
+
 def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
@@ -84,8 +98,8 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         if hasattr(target_model, "get_language_model")
         else target_model
     )
-    target_inner = target_language_model.model
-    draft_inner = draft_model.model
+    target_inner = _inner_model(target_language_model)
+    draft_inner = _inner_model(draft_model)
     target_vocab_size = vllm_config.model_config.get_vocab_size()
 
     target_embed = getattr(target_inner, "embed_tokens", None)
@@ -102,18 +116,14 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         draft_inner.embed_tokens = target_embed
 
     target_lm_head = get_target_lm_head(target_model, target_language_model)
-    draft_lm_head = getattr(draft_model, "lm_head", None)
-    draft_output_vocab_size = (
-        getattr(draft_model_config.hf_config, "draft_vocab_size", None)
-        or draft_model_config.get_vocab_size()
+    draft_head_owner, draft_head_name, draft_lm_head = _find_module_attr(
+        draft_model, "lm_head", "head"
     )
-    if (
-        target_lm_head is not None
-        and draft_output_vocab_size == target_vocab_size
-        and _should_share(draft_model, "has_own_lm_head", draft_lm_head, target_lm_head)
+    if target_lm_head is not None and _should_share(
+        draft_model, "has_own_lm_head", draft_lm_head, target_lm_head
     ):
         if draft_lm_head is not None:
-            del draft_model.lm_head
-        draft_model.lm_head = target_lm_head
+            delattr(draft_head_owner, draft_head_name)
+        setattr(draft_head_owner, draft_head_name, target_lm_head)
 
     return draft_model

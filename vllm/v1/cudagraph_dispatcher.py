@@ -310,9 +310,13 @@ class CudagraphDispatcher:
             if batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.FULL]:
                 return CUDAGraphMode.FULL, batch_desc_to_check
 
-        if CUDAGraphMode.PIECEWISE in allowed_modes:
+        if CUDAGraphMode.PIECEWISE in allowed_modes and not (
+            uniform_decode and self.uniform_decode_query_len > 1
+        ):
             # also check if the relaxed key exists for more "general"
-            # piecewise cudagraph
+            # piecewise cudagraph. Speculative decode verification batches have
+            # request-layout-dependent metadata, so they cannot safely fall
+            # back to this relaxed key.
             batch_desc_to_check = replace(batch_desc, num_reqs=None, uniform=False)
             if batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.PIECEWISE]:
                 return CUDAGraphMode.PIECEWISE, batch_desc_to_check

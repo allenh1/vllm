@@ -85,6 +85,27 @@ class _DSparkForwardCUDAGraph:
             main_positions.data_ptr(),
         )
 
+    def _lock_graph_pool(self) -> None:
+        if not hasattr(self, "_graph_pool_locked"):
+            self._graph_pool_locked = False
+        if self._graph_pool_locked:
+            return
+        if self.graph is None:
+            return
+        try:
+            import ctypes
+            pool_handle = self.graph.pool()
+            if pool_handle is None or pool_handle == 0:
+                return
+            pool = ctypes.c_void_p(pool_handle)
+            threshold = ctypes.c_size_t(2 ** 40)
+            cudart = torch.cuda.cudart()
+            cudart.cudaMemPoolSetAttribute(
+                pool, 4, ctypes.byref(threshold))
+            self._graph_pool_locked = True
+        except Exception:
+            pass
+
     def __call__(
         self,
         input_ids: torch.Tensor | None,
@@ -194,6 +215,7 @@ class _DSparkForwardCUDAGraph:
                     output = self.model(**capture_kwargs)
             self.graph = graph
             self.output = output
+            self._lock_graph_pool()
             self.capture_args = ()
             self.capture_kwargs = capture_kwargs
             self.input_key = input_key

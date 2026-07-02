@@ -776,6 +776,73 @@ class DeepSeekV4DSpark(nn.Module):
             prefix=f"{prefix}mtp.2.confidence_head.proj",
             return_bias=False,
         )
+        self._graph_pool_locked = False
+        self.hidden_size = int(config.hidden_size)
+        self.vocab_size = int(config.vocab_size)
+        _sl = next(iter(self.layers.values()))
+        self.window_size = _sl.window_size
+        self.head_dim = _sl.attn.head_dim
+        self.warmup_aux_kernels(self.max_batch, self.block_size)
+
+    def warmup_aux_kernels(self, batch_size: int, block_size: int) -> None:
+        if self._graph_pool_locked:
+            return
+        import torch
+        device = torch.device("cuda")
+        vs = getattr(self, 'vocab_size', None)
+        if vs is None:
+            return
+        try:
+            from vllm.models.deepseek_v4.nvidia.dspark_triton import (
+                dspark_markov_probs_sample,
+            )
+            vb = 1024
+            nb = (vs + vb - 1) // vb
+            dtype = torch.bfloat16
+            step_logits = torch.empty(1, vs, device=device, dtype=dtype)
+            inv_temp = torch.empty(1, device=device, dtype=torch.float32)
+            is_greedy = torch.zeros(1, dtype=torch.int32, device=device)
+            out_tokens = torch.empty(1, dtype=torch.long, device=device)
+            out_probs = torch.empty(1, vs, device=device, dtype=torch.float32)
+            scratch = {
+                "block_max": torch.empty(1, nb, device=device, dtype=torch.float32),
+                "block_sumexp": torch.empty(1, nb, device=device, dtype=torch.float32),
+                "block_maxid": torch.empty(1, nb, dtype=torch.int32, device=device),
+                "block_gval": torch.empty(1, nb, device=device, dtype=torch.float32),
+                "block_gid": torch.empty(1, nb, dtype=torch.int32, device=device),
+                "row_max": torch.empty(1, device=device, dtype=torch.float32),
+                "row_invz": torch.empty(1, device=device, dtype=torch.float32),
+            }
+            dspark_markov_probs_sample(
+                step_logits, inv_temp, is_greedy,
+                out_tokens, out_probs, scratch, seed=42,
+            )
+            step_logits_f32 = step_logits.to(torch.float32)
+            dspark_markov_probs_sample(
+                step_logits_f32, inv_temp, is_greedy,
+                out_tokens, out_probs, scratch, seed=42,
+            )
+        except Exception as exc:
+            import sys
+            print(f"[WARMUP] dspark kernel warmup failed: {exc}", file=sys.stderr)
+        self._lock_graph_pool()
+
+    def _lock_graph_pool(self) -> None:
+        if self._graph_pool_locked:
+            return
+        try:
+            import ctypes
+            import torch
+            cudart = torch.cuda.cudart()
+            pool = ctypes.c_void_p()
+            cudart.cudaDeviceGetDefaultMemPool(
+                ctypes.byref(pool), 0)
+            threshold = ctypes.c_size_t(2 ** 40)
+            cudart.cudaMemPoolSetAttribute(
+                pool, 4, ctypes.byref(threshold))
+            self._graph_pool_locked = True
+        except Exception:
+            pass
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -842,6 +909,7 @@ class DeepSeekV4DSpark(nn.Module):
         main_positions: torch.Tensor | None = None,
         main_x: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        self._lock_graph_pool()
         if input_ids is None:
             raise ValueError("DSpark requires input_ids")
 

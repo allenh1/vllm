@@ -671,19 +671,14 @@ class VllmConfig:
         if use_v2_model_runner is not None:
             return use_v2_model_runner
 
-        # PCP runtime support is implemented only by the V2 model runner.
+# PCP runtime support is implemented only by the V2 model runner.
         if self.parallel_config.prefill_context_parallel_size > 1:
             return True
 
-        # DSpark is implemented only by the V2 GPU model runner, and DeepSeek-V4
-        # is not otherwise a default-V2 architecture, so force V2 for it. If V2
-        # is unsupported for the rest of the config, _validate_v2_model_runner
-        # raises rather than silently falling back to V1 (which can't run dspark).
-        if (
-            self.speculative_config is not None
-            and self.speculative_config.method == "dspark"
-        ):
-            return True
+        # DSpark runs on both the V1 and V2 GPU model runners. Do not force V2
+        # so DSpark follows normal runner selection (V1 by default for
+        # DeepSeek-V4, which has correct long-context recall there). Opt into the
+        # V2 DSpark speculator explicitly with VLLM_USE_V2_MODEL_RUNNER=1.
 
         # Mixed sliding/full DFlash drafts need multiple KV groups (V2 only);
         # force V2 as for dspark, since a hybrid target otherwise defaults to V1.

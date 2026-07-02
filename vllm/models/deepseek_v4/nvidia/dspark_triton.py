@@ -443,7 +443,6 @@ def _dspark_attention_kernel(
     offs_d = tl.arange(0, BLOCK_D)
     d_mask = offs_d < head_dim
 
-    # q_flat[batch] is [block*heads, head_dim] contiguous; row = draft*heads + head
     q_base = batch_idx * rows_per_batch * head_dim
     q_ptrs = q_ptr + q_base + offs_m[:, None] * head_dim + offs_d[None, :]
     q = tl.load(q_ptrs, mask=m_valid[:, None] & d_mask[None, :], other=0.0)
@@ -453,43 +452,71 @@ def _dspark_attention_kernel(
     valid_main_end = tl.load(main_pos_ptr + batch_idx)
     valid_main_end = tl.minimum(valid_main_end, window_size - 1)
 
-    # sink folded in as a keyless logit: init running max=sink, denom=1, acc=0
-    m_i = sink
-    l_i = tl.full((BLOCK_M,), 1.0, dtype=tl.float32)
-    acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
-
-    total_kv: tl.constexpr = window_size + block_size
-    for start in range(0, total_kv, BLOCK_N):
+    # ---- First pass: max_score from main_kv ----
+    max_score = sink
+    for start in range(0, window_size, BLOCK_N):
         offs_n = start + tl.arange(0, BLOCK_N)
-        main_mask = offs_n < window_size
-        draft_off = offs_n - window_size
-        valid_n = tl.where(main_mask, offs_n <= valid_main_end, draft_off < block_size)
-
-        main_ptrs = (
+        n_mask = offs_n < window_size
+        valid = offs_n <= valid_main_end
+        kv_ptrs = (
             main_kv_ptr
             + (batch_idx * window_size + offs_n[:, None]) * head_dim
             + offs_d[None, :]
         )
-        draft_ptrs = (
+        kv = tl.load(kv_ptrs, mask=n_mask[:, None] & valid[:, None] & d_mask[None, :], other=0.0)
+        scores = tl.sum(kv * q[None, :], axis=1) * scale
+        scores = tl.where(valid, scores, -float("inf"))
+        max_score = tl.maximum(max_score, tl.max(scores, axis=0))
+
+    # ---- First pass: max_score from draft_kv ----
+    for start in range(0, block_size, BLOCK_N):
+        offs_dr = start + tl.arange(0, BLOCK_N)
+        d_mask2 = offs_dr < block_size
+        kv_ptrs = (
             draft_kv_ptr
-            + (batch_idx * block_size + draft_off[:, None]) * head_dim
+            + (batch_idx * block_size + offs_dr[:, None]) * head_dim
             + offs_d[None, :]
         )
-        kv_ptrs = tl.where(main_mask[:, None], main_ptrs, draft_ptrs)
-        kv = tl.load(kv_ptrs, mask=valid_n[:, None] & d_mask[None, :], other=0.0)
+        kv = tl.load(kv_ptrs, mask=d_mask2[:, None] & d_mask[None, :], other=0.0)
+        scores = tl.sum(kv * q[None, :], axis=1) * scale
+        max_score = tl.maximum(max_score, tl.max(scores, axis=0))
 
-        scores = tl.dot(q, tl.trans(kv)).to(tl.float32) * scale
-        scores = tl.where(valid_n[None, :], scores, -float("inf"))
+    # ---- Second pass: softmax + accumulate from main_kv ----
+    denom = tl.exp(sink - max_score)
+    acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+    for start in range(0, window_size, BLOCK_N):
+        offs_n = start + tl.arange(0, BLOCK_N)
+        n_mask = offs_n < window_size
+        valid = offs_n <= valid_main_end
+        kv_ptrs = (
+            main_kv_ptr
+            + (batch_idx * window_size + offs_n[:, None]) * head_dim
+            + offs_d[None, :]
+        )
+        kv = tl.load(kv_ptrs, mask=n_mask[:, None] & valid[:, None] & d_mask[None, :], other=0.0)
+        scores = tl.sum(kv * q[None, :], axis=1) * scale
+        scores = tl.where(valid, scores, -float("inf"))
+        probs = tl.exp(scores - max_score)
+        probs = tl.where(valid, probs, 0.0)
+        denom += tl.sum(probs, axis=0)
+        acc += tl.sum(kv * probs[:, None], axis=0)
 
-        m_new = tl.maximum(m_i, tl.max(scores, axis=1))
-        alpha = tl.exp(m_i - m_new)
-        p = tl.exp(scores - m_new[:, None])
-        p = tl.where(valid_n[None, :], p, 0.0)
-        l_i = l_i * alpha + tl.sum(p, axis=1)
-        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), kv)
-        m_i = m_new
+    # ---- Second pass: softmax + accumulate from draft_kv ----
+    for start in range(0, block_size, BLOCK_N):
+        offs_dr = start + tl.arange(0, BLOCK_N)
+        d_mask2 = offs_dr < block_size
+        kv_ptrs = (
+            draft_kv_ptr
+            + (batch_idx * block_size + offs_dr[:, None]) * head_dim
+            + offs_d[None, :]
+        )
+        kv = tl.load(kv_ptrs, mask=d_mask2[:, None] & d_mask[None, :], other=0.0)
+        scores = tl.sum(kv * q[None, :], axis=1) * scale
+        probs = tl.exp(scores - max_score)
+        denom += tl.sum(probs, axis=0)
+        acc += tl.sum(kv * probs[:, None], axis=0)
 
-    out = acc / l_i[:, None]
+    out = acc / denom[:, None]
     out_ptrs = out_ptr + q_base + offs_m[:, None] * head_dim + offs_d[None, :]
     tl.store(out_ptrs, out, mask=m_valid[:, None] & d_mask[None, :])
 

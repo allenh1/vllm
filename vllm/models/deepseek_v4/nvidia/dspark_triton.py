@@ -464,8 +464,8 @@ def _dspark_attention_kernel(
             + offs_d[None, :]
         )
         kv = tl.load(kv_ptrs, mask=n_mask[:, None] & valid[:, None] & d_mask[None, :], other=0.0)
-        scores = tl.sum(kv * q[None, :], axis=1) * scale
-        scores = tl.where(valid, scores, -float("inf"))
+        scores = tl.sum(kv[:, None, :] * q[None, :, :], axis=-1) * scale
+        scores = tl.where(valid[:, None], scores, -float("inf"))
         max_score = tl.maximum(max_score, tl.max(scores, axis=0))
 
     # ---- First pass: max_score from draft_kv ----
@@ -478,7 +478,7 @@ def _dspark_attention_kernel(
             + offs_d[None, :]
         )
         kv = tl.load(kv_ptrs, mask=d_mask2[:, None] & d_mask[None, :], other=0.0)
-        scores = tl.sum(kv * q[None, :], axis=1) * scale
+        scores = tl.sum(kv[:, None, :] * q[None, :, :], axis=-1) * scale
         max_score = tl.maximum(max_score, tl.max(scores, axis=0))
 
     # ---- Second pass: softmax + accumulate from main_kv ----
@@ -494,12 +494,12 @@ def _dspark_attention_kernel(
             + offs_d[None, :]
         )
         kv = tl.load(kv_ptrs, mask=n_mask[:, None] & valid[:, None] & d_mask[None, :], other=0.0)
-        scores = tl.sum(kv * q[None, :], axis=1) * scale
-        scores = tl.where(valid, scores, -float("inf"))
+        scores = tl.sum(kv[:, None, :] * q[None, :, :], axis=-1) * scale
+        scores = tl.where(valid[:, None], scores, -float("inf"))
         probs = tl.exp(scores - max_score)
-        probs = tl.where(valid, probs, 0.0)
+        probs = tl.where(valid[:, None], probs, 0.0)
         denom += tl.sum(probs, axis=0)
-        acc += tl.sum(kv * probs[:, None], axis=0)
+        acc += tl.dot(probs.T.to(kv.dtype), kv)
 
     # ---- Second pass: softmax + accumulate from draft_kv ----
     for start in range(0, block_size, BLOCK_N):
@@ -511,10 +511,10 @@ def _dspark_attention_kernel(
             + offs_d[None, :]
         )
         kv = tl.load(kv_ptrs, mask=d_mask2[:, None] & d_mask[None, :], other=0.0)
-        scores = tl.sum(kv * q[None, :], axis=1) * scale
+        scores = tl.sum(kv[:, None, :] * q[None, :, :], axis=-1) * scale
         probs = tl.exp(scores - max_score)
         denom += tl.sum(probs, axis=0)
-        acc += tl.sum(kv * probs[:, None], axis=0)
+        acc += tl.dot(probs.T.to(kv.dtype), kv)
 
     out = acc / denom[:, None]
     out_ptrs = out_ptr + q_base + offs_m[:, None] * head_dim + offs_d[None, :]

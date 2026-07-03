@@ -4,61 +4,79 @@ import pytest
 import torch
 
 
-def test_deepseek_v4_c128a_adaptive_width_has_capture_stable_stride():
+def test_deepseek_v4_c128a_dynamic_topk_packed_buffers():
     from vllm.models.deepseek_v4.sparse_mla import build_c128a_topk_metadata
 
     device = torch.device("cuda")
-    capacity_width = 512
-    global_decode_buffer = torch.empty(
+    capacity_width = 256
+    active_width = 128
+    topk_buffer = torch.empty(
         (2, capacity_width), dtype=torch.int32, device=device
     )
-    prefill_buffer = torch.empty_like(global_decode_buffer)
-    kwargs = dict(
-        positions=torch.tensor([255, 511, 383, 639], device=device),
+    decode_lens_buffer = torch.empty(2, dtype=torch.int32, device=device)
+
+    global_decode, decode_lens, prefill_local = build_c128a_topk_metadata(
+        positions=torch.tensor([255, 511], dtype=torch.int64, device=device),
         compress_ratio=128,
-        num_decode_tokens=2,
-        token_to_req_indices=torch.tensor(
-            [0, 1, 0, 1], dtype=torch.int32, device=device
-        ),
-        block_table=torch.tensor([[3], [5]], dtype=torch.int32, device=device),
+        num_decode_tokens=1,
+        token_to_req_indices=torch.tensor([0, 0], dtype=torch.int32, device=device),
+        block_table=torch.tensor([[3]], dtype=torch.int32, device=device),
         block_size=capacity_width,
-        slot_mapping=torch.arange(4, dtype=torch.int64, device=device),
-        global_decode_buffer=global_decode_buffer,
-        decode_lens_buffer=torch.empty(2, dtype=torch.int32, device=device),
-        prefill_buffer=prefill_buffer,
+        slot_mapping=torch.tensor([0, 1], dtype=torch.int64, device=device),
+        topk_buffer=topk_buffer,
+        decode_lens_buffer=decode_lens_buffer,
+        max_compressed_tokens=active_width,
     )
-    captured_decode, _, captured_prefill = build_c128a_topk_metadata(
-        max_compressed_tokens=256,
-        **kwargs,
+
+    assert global_decode.shape == (1, active_width)
+    assert prefill_local.shape == (1, active_width)
+    assert global_decode.stride() == (active_width, 1)
+    assert prefill_local.stride() == (active_width, 1)
+    assert global_decode[0, :2].cpu().tolist() == [768, 769]
+    assert decode_lens.cpu().tolist() == [2]
+    assert prefill_local[0, :4].cpu().tolist() == list(range(4))
+    assert torch.all(global_decode[0, 2:] == -1)
+    assert torch.all(prefill_local[0, 4:] == -1)
+
+
+def test_compute_global_topk_indices_and_lens_allows_inplace_output():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the Triton sparse index kernel")
+
+    from vllm.models.deepseek_v4.common.ops import compute_global_topk_indices_and_lens
+
+    device = torch.device("cuda")
+    local_indices = torch.tensor(
+        [[0, 1, -1, 5], [2, -1, 3, 4]],
+        dtype=torch.int32,
+        device=device,
     )
-    assert captured_decode.shape == captured_prefill.shape == (2, 256)
-    assert captured_decode.stride(0) == captured_prefill.stride(0) == capacity_width
+    token_to_req_indices = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    block_table = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32, device=device)
+    is_valid_token = torch.tensor([True, True], dtype=torch.bool, device=device)
 
-    captured_rows = torch.empty((4, 4), dtype=torch.int32, device=device)
-    captured_rows[:2].copy_(captured_decode[:, :4])
-    captured_rows[2:].copy_(captured_prefill[:, :4])
-    torch.accelerator.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured_rows[:2].copy_(captured_decode[:, :4])
-        captured_rows[2:].copy_(captured_prefill[:, :4])
-
-    global_decode_buffer.fill_(-99)
-    prefill_buffer.fill_(-99)
-    build_c128a_topk_metadata(
-        max_compressed_tokens=128,
-        **kwargs,
+    expected_indices, expected_lens = compute_global_topk_indices_and_lens(
+        local_indices.clone(),
+        token_to_req_indices,
+        block_table,
+        block_size=4,
+        is_valid_token=is_valid_token,
     )
-    graph.replay()
 
-    assert captured_rows.cpu().tolist() == [
-        [1536, 1537, -1, -1],
-        [2560, 2561, 2562, 2563],
-        [0, 1, 2, -1],
-        [0, 1, 2, 3],
-    ]
-    assert torch.all(global_decode_buffer[:, 128:] == -99)
-    assert torch.all(prefill_buffer[:, 128:] == -99)
+    lens = torch.empty((local_indices.shape[0],), dtype=torch.int32, device=device)
+    actual_indices, actual_lens = compute_global_topk_indices_and_lens(
+        local_indices,
+        token_to_req_indices,
+        block_table,
+        block_size=4,
+        is_valid_token=is_valid_token,
+        output_buffers=(local_indices, lens),
+    )
+
+    assert actual_indices.data_ptr() == local_indices.data_ptr()
+    assert actual_lens.data_ptr() == lens.data_ptr()
+    torch.testing.assert_close(actual_indices.cpu(), expected_indices.cpu())
+    torch.testing.assert_close(actual_lens.cpu(), expected_lens.cpu())
 
 
 def test_sparse_flashmla_metadata_smoke():

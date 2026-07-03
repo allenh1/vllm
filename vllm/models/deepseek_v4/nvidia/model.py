@@ -1216,6 +1216,15 @@ def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:
     )
 
 
+def _needs_mtp_target_hidden_buffer(vllm_config: VllmConfig) -> bool:
+    spec_config = vllm_config.speculative_config
+    if spec_config is None or spec_config.method != "mtp":
+        return False
+    draft_config = spec_config.draft_model_config
+    hf_config = getattr(draft_config, "hf_config", None)
+    return hasattr(hf_config, "compress_ratios") and hasattr(hf_config, "hc_mult")
+
+
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -1474,11 +1483,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             torch.empty(1, dtype=torch.float32),
             requires_grad=False,
         )
-        spec_config = vllm_config.speculative_config
-        needs_mtp_hidden_states = spec_config is not None and (
-            spec_config.use_eagle() or spec_config.uses_draft_model()
-        )
-        if get_pp_group().is_last_rank and needs_mtp_hidden_states:
+# Pre-hc_head residual stream buffer for the MTP draft. Stable
+        # address (outside the cudagraph pool) so the copy_ in forward()
+        # refreshes it correctly across captured shapes. Only allocate it
+        # when an MTP drafter can consume it; DSpark/DFlash use aux hidden
+        # states instead.
+        if get_pp_group().is_last_rank and _needs_mtp_target_hidden_buffer(
+            vllm_config
+        ):
             self._mtp_hidden_buffer = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 self.hc_dim,
@@ -1581,6 +1593,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
 
         if self._mtp_hidden_buffer is not None:
+            # Stash pre-hc_head residual for the MTP draft (captured copy_).
             num_tokens = hidden_states.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 

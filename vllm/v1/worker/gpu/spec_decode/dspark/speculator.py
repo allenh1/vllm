@@ -47,7 +47,12 @@ class DSparkSpeculator(DFlashSpeculator):
         draft_hidden = (
             vllm_config.speculative_config.draft_model_config.get_hidden_size()
         )
-        super().__init__(vllm_config, device, hidden_states_size=draft_hidden)
+        super().__init__(
+            vllm_config,
+            device,
+            hidden_states_size=draft_hidden,
+            allocate_hidden_states=False,
+        )
 
         # Whether to sample from the anchor position. When True, uses anchor-as-first
         # (N slots, each position predicts the next token). When False, uses 1+N

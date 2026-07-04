@@ -443,11 +443,26 @@ class StructuredOutputManager:
         if reasoner.is_reasoning_end_streaming(all_token_ids, delta_ids):
             structured_req.reasoning_ended = True
 
-            # Record the boundary so the scheduler can exclude reasoning tokens.
-            end_index = self._find_reasoning_end_index(reasoner, all_token_ids, start)
-
-            structured_req.reasoning_end_token_index = end_index
-            return True
+            # Reasoning just ended this step. Defer FSM advance until the next
+            # pass (see reasoning_ended check above) for JSON/regex/choice/grammar:
+            # advancing on the closing boundary token can accept tokens that still
+            # belong to the reasoning stream. Structural tags are the only safe
+            # same-step exception: they model phased output (e.g. thinking tag ->
+            # answer tag), and speculative decoding must run grammar.validate_tokens
+            # on draft tokens produced immediately after that transition.
+            if (
+                self.vllm_config.speculative_config is not None
+                and structured_req.structured_output_key[0]
+                == StructuredOutputOptions.STRUCTURAL_TAG
+            ):
+                # The scheduler will advance the grammar with this step's
+                # tokens right away, but the step still contains reasoning
+                # content up to and including the end marker. Record where
+                # it ends so trim_reasoning_for_advance() can drop it.
+                structured_req.reasoning_end_token_index = (
+                    self._find_reasoning_end_index(reasoner, all_token_ids, start)
+                )
+                return True
 
         return False
 

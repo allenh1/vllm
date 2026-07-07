@@ -1155,9 +1155,10 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     When ``VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE`` is set and the runtime is
     SM12x with FlashInfer's packed sparse-MLA decode kernel available, decode is
     routed through the official ``trtllm_batch_decode_sparse_mla_dsv4`` SM120
-    kernel (FlashInfer PR3395) instead of the FlashMLA decode kernel; everything
-    else (packed ``fp8_ds_mla`` cache, metadata, prefill) is unchanged.
-    Default off.
+    kernel (FlashInfer PR3395, released in flashinfer >= 0.6.13) instead of the
+    FlashMLA decode kernel; everything else (packed ``fp8_ds_mla`` cache,
+    metadata, prefill) is unchanged. Availability-gated (silent FlashMLA fallback
+    when the kernel is absent). Default on.
     """
     backend = vllm_config.attention_config.backend
     device_capability = current_platform.get_device_capability()

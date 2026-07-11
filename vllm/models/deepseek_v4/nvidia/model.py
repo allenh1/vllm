@@ -1181,6 +1181,11 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     ):
         return DeepseekV4FlashMLAAttention
 
+# Default-on: SM12x decode uses FlashInfer's official packed sparse-MLA
+    # decode kernel (PR3395, released in flashinfer >= 0.6.13) when present.
+    # Availability-gated, so stock installs without that kernel fall through to
+    # the FlashMLA/Triton-sparse default below instead of raising.
+
     if envs.VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE:
         from vllm.utils.flashinfer import has_flashinfer_trtllm_sparse_mla_dsv4
 

@@ -60,6 +60,7 @@ from .dspark_triton import (
     dspark_triton_attention,
 )
 from .model import (
+    DeepseekV4Model,
     DeepseekV4MoE,
     _select_dsv4_attn_cls,
     make_deepseek_v4_expert_params_mapping,
@@ -699,13 +700,17 @@ class DeepSeekV4DSpark(nn.Module):
         self.max_batch = max(1, int(vllm_config.scheduler_config.max_num_seqs))
         hidden_size = int(config.hidden_size)
         dtype = vllm_config.model_config.dtype
-        quant_config = get_draft_quant_config(vllm_config)
+        self.quant_config = get_draft_quant_config(vllm_config)
+        self.pad_shared_expert = (
+            getattr(self.quant_config, "weight_block_size", None) is not None
+            and not vllm_config.parallel_config.use_sequence_parallel_moe
+        )
         self.dspark_aux_hidden_size = hidden_size * len(self.target_layer_ids)
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             hidden_size,
-            quant_config=quant_config,
+            quant_config=self.quant_config,
             prefix=f"{prefix}embed_tokens",
         )
         self.main_proj = ReplicatedLinear(
@@ -713,7 +718,7 @@ class DeepSeekV4DSpark(nn.Module):
             hidden_size,
             bias=False,
             params_dtype=dtype,
-            quant_config=quant_config,
+            quant_config=self.quant_config,
             prefix=f"{prefix}mtp.0.main_proj",
             return_bias=False,
         )
@@ -1045,6 +1050,12 @@ class DeepSeekV4DSpark(nn.Module):
                     else ".weight_scale_inv"
                 )
                 name = name.removesuffix(".scale") + suffix
+            if ".shared_experts.w2" in name:
+                name = name.replace(".shared_experts.w2", ".shared_experts.down_proj")
+            if self.pad_shared_expert and ".shared_experts." in name:
+                loaded_weight = DeepseekV4Model._pad_shared_expert_weight(
+                    self.quant_config, name, loaded_weight
+                )
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if not name.startswith("layers."):
                     continue

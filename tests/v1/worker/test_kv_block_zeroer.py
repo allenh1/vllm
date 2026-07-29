@@ -342,3 +342,35 @@ def test_zeroes_exactly_one_block_per_layer(layout: KVCacheLayout):
             assert (view[b].view(torch.int8) == 1).all(), layout
     zero_bytes = int((raw == 0).sum().item())
     assert zero_bytes == num_layers * spec.page_size_bytes, layout
+def test_packed_segment_zeros_only_its_last_block_page():
+    """A packed KV segment steps by block stride but clears only its page."""
+    device = torch.device("cuda")
+    num_blocks = 4
+    block_stride_el = 12
+    page_size_el = 4
+    page_offset_el = 3
+    backing = torch.ones(
+        (num_blocks, block_stride_el), dtype=torch.int32, device=device
+    )
+
+    zeroer = KVBlockZeroer.__new__(KVBlockZeroer)
+    zeroer.device = device
+    zeroer._meta = (
+        torch.tensor(
+            [backing.data_ptr() + page_offset_el * backing.element_size()],
+            dtype=torch.uint64,
+            device=device,
+        ),
+        torch.tensor([block_stride_el], dtype=torch.int64, device=device),
+        torch.tensor([page_size_el], dtype=torch.int64, device=device),
+        1,
+        page_size_el,
+        1,
+    )
+
+    zeroer.zero_block_ids([num_blocks - 1])
+    torch.accelerator.synchronize()
+
+    expected = torch.ones_like(backing)
+    expected[-1, page_offset_el : page_offset_el + page_size_el] = 0
+    assert torch.equal(backing, expected)

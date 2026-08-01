@@ -1282,8 +1282,14 @@ class SpeculativeConfig:
                         draft_hf.vocab_size = target_vocab
                         draft_hf.truncated_vocab_size = target_vocab
 
-                # Automatically detect the method
-                if self.method in ("eagle", "eagle3", "dflash", "dspark"):
+                # Automatically detect the method. An explicitly requested method
+                # is never overridden: DeepSeek-V4-Flash-0731 folded the DSpark
+                # draft into the main checkpoint, so `dspark_block_size` is now
+                # present for every DSv4 config. Without "mtp" in this tuple the
+                # chain below reaches the dspark branch, silently rewrites
+                # method="mtp" to "dspark", and then fails validation with a
+                # DSpark message the user never asked for.
+                if self.method in ("eagle", "eagle3", "dflash", "dspark", "mtp"):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -1445,6 +1451,39 @@ class SpeculativeConfig:
 
                 dspark_draft_topk = None
                 if self.method == "dspark":
+                    # DSpark is a semi-autoregressive *block* drafter that emits
+                    # exactly one block of dspark_block_size per pass. Fewer
+                    # tokens feed the block / Markov-head machinery an
+                    # unsupported layout and garble output; more tokens are
+                    # simply never accepted -- measured on 2x GB10 (SM121a) with
+                    # DeepSeek-V4-Flash-0731 (dspark_block_size=5), draft
+                    # positions 5 and 6 accepted 0.000 in every sample while mean
+                    # acceptance length *fell*:
+                    #
+                    #   probabilistic  nst=5: 2.19 (23.8%)  nst=7: 2.03 (14.7%)
+                    #   greedy         nst=5: 2.11 (22.2%)  nst=7: 1.75 (10.8%)
+                    #
+                    # so nst>block drafts 40% more tokens per step and accepts
+                    # fewer of them. Require an exact match.
+                    dspark_block_size = getattr(
+                        self.draft_model_config.hf_config,
+                        "dspark_block_size",
+                        None,
+                    )
+                    if (
+                        dspark_block_size is not None
+                        and self.num_speculative_tokens != dspark_block_size
+                    ):
+                        raise ValueError(
+                            "DSpark requires num_speculative_tokens == "
+                            f"dspark_block_size ({dspark_block_size}); got "
+                            f"{self.num_speculative_tokens}. The drafter emits "
+                            "exactly one block per pass: smaller values garble "
+                            "output, larger values are never accepted and only "
+                            "waste draft compute. Use "
+                            f"num_speculative_tokens={dspark_block_size}."
+                        )
+
                     hf_config = self.draft_model_config.hf_config
                     dspark_draft_topk = self.dspark_draft_topk
                     if dspark_draft_topk is None:

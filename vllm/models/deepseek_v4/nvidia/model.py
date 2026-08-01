@@ -24,11 +24,10 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
-    mhc_fused_post_pre_tilelang,
     mhc_fused_post_pre_tilelang_reuse_residual,
     mhc_post_hc_head_tilelang,
-    mhc_post_mean_tilelang,
     mhc_post_mean_hc_head_tilelang,
+    mhc_post_mean_tilelang,
     mhc_post_tilelang,
     mhc_pre_broadcast_tilelang,
     mhc_pre_tilelang,
@@ -81,6 +80,7 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_shard,
 )
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4.eager_scratch import DeepseekV4EagerScratchPool
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
     DeepseekV4FlashInferSM120Attention,
@@ -1434,6 +1434,32 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # (compressor kv_score, indexer.weights_proj, indexer.compressor
         # kv_score). fused_wqa_wkv stays on the default stream.
         aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
+        n_local_heads = (
+            config.num_attention_heads // get_tensor_model_parallel_world_size()
+        )
+        padded_heads = _select_dsv4_attn_cls(vllm_config).get_padded_num_q_heads(
+            n_local_heads
+        )
+        self.eager_scratch_pool: DeepseekV4EagerScratchPool | None = None
+        if not vllm_config.parallel_config.use_ubatching:
+            # TODO: support dbo if needed
+            # this requires the buffer to have ubatch dim
+            self.eager_scratch_pool = DeepseekV4EagerScratchPool(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                padded_heads,
+                config.head_dim,
+                config.index_n_heads,
+                config.index_head_dim,
+                config.index_topk,
+                current_platform.device_type,
+                # Same predicate as DeepseekV4Attention._qnorm_rope_can_write_inplace,
+                # evaluated on the same two model-wide quantities: when Q needs no
+                # padding, attention writes it in place and the pool's Q buffer is
+                # never read. True on the default SM12x path (the FlashInfer-SM120
+                # decode class pads to {16,32,64,128}, so 64/TP maps to itself);
+                # false on the FlashMLA class, which pads everything to 64.
+                allocate_q=padded_heads != n_local_heads,
+            )
 
         # Reserved topk indices buffer for all Indexer layers to reuse.
         self.topk_indices_buffer = torch.empty(

@@ -207,6 +207,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         prefix: str,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
+        eager_scratch_pool: "DeepseekV4EagerScratchPool | None" = None,
     ) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -292,6 +293,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         )
         self.indexer_rotary_emb = self.rotary_emb
         self.topk_indices_buffer = topk_indices_buffer
+        self.eager_scratch_pool = eager_scratch_pool
 
         self.indexer = None
         if self.compress_ratio == 4:
@@ -313,6 +315,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 compress_ratio=self.compress_ratio,
                 prefix=f"{prefix}.indexer",
                 aux_stream=indexer_aux_stream,
+                eager_scratch_pool=eager_scratch_pool,
             )
 
         self._prepare_and_attn_fn = self._prepare_and_attn
@@ -375,6 +378,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 rotate=True,
                 prefix=f"{prefix}.compressor",
                 k_cache_prefix=self.prefix,
+                eager_scratch_pool=eager_scratch_pool,
             )
 
     @staticmethod
@@ -421,6 +425,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         return scratch
 
     def _get_q_padded_scratch(self, q: torch.Tensor) -> torch.Tensor:
+        # dtype is part of the buffer cache key, and reserve_profile_scratch
+        # reserves under model_config.dtype while this reads under the runtime
+        # q.dtype. If they ever diverge the profile run warms a buffer nobody
+        # reads and the real one is allocated lazily afterwards -- which is
+        # exactly the post-profiling OOM the reservation exists to prevent
+        # (jasl/vllm#26). Keep the assumption loud rather than implicit.
+        assert q.dtype == self._q_padded_scratch_dtype, (
+            f"q dtype {q.dtype} differs from the reserved scratch dtype "
+            f"{self._q_padded_scratch_dtype}; the profile-run reservation would "
+            "not be reused."
+        )
         num_tokens = q.shape[0]
         reserved_tokens = max(num_tokens, int(self.max_num_batched_tokens))
         scratch = self._reserve_q_padded_scratch_buffer(
@@ -907,6 +922,7 @@ class DeepseekV4Indexer(nn.Module):
         compress_ratio: int = 1,
         prefix: str = "",
         aux_stream: torch.cuda.Stream | None = None,
+        eager_scratch_pool: "DeepseekV4EagerScratchPool | None" = None,
     ):
         super().__init__()
         self.vllm_config = vllm_config
@@ -945,6 +961,7 @@ class DeepseekV4Indexer(nn.Module):
         self.scale_fmt = "ue8m0"
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
+        self.eager_scratch_pool = eager_scratch_pool
 
         self.max_model_len = (
             vllm_config.model_config.max_model_len // self.compress_ratio
@@ -982,6 +999,7 @@ class DeepseekV4Indexer(nn.Module):
             prefix=f"{prefix}.compressor",
             k_cache_prefix=self.k_cache.prefix,
             use_fp4_cache=self.use_fp4_kv,
+            eager_scratch_pool=eager_scratch_pool,
         )
 
         self.indexer_op = SparseAttnIndexer(

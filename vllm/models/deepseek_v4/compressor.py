@@ -211,6 +211,7 @@ class DeepseekCompressor(nn.Module):
         prefix: str = "",
         k_cache_prefix="",
         use_fp4_cache: bool = False,
+        eager_scratch_pool: "DeepseekV4EagerScratchPool | None" = None,
     ):
         super().__init__()
         self.compress_ratio = compress_ratio
@@ -220,6 +221,7 @@ class DeepseekCompressor(nn.Module):
         self.prefix = prefix
         self.k_cache_prefix = k_cache_prefix
         self.use_fp4_cache = use_fp4_cache
+        self.eager_scratch_pool = eager_scratch_pool
 
         config = vllm_config.model_config.hf_config
         self.rope_head_dim = config.qk_rope_head_dim
@@ -413,6 +415,10 @@ class DeepseekCompressor(nn.Module):
                 store_full_fp8=store_full_fp8,
                 fp8_scale=fp8_scale,
             )
+            if not self.overlap and self.eager_scratch_pool is not None:
+                extra_kwargs["compress_scratch"] = (
+                    self.eager_scratch_pool.compressor_scratch(num_actual)
+                )
         elif self._use_two_stage_fused_compressor:
             # head=512 cr>=128 (no overlap): two-pass split compressor on the
             # prefill suffix, single-pass on the decode prefix.

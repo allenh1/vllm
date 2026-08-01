@@ -5,10 +5,8 @@
 # docs/contributing/dockerfile/dockerfile.md and
 # docs/assets/contributing/dockerfile-stages-dependency.png
 
-# =============================================================================
-# VERSION MANAGEMENT
-# =============================================================================
-# ARG defaults in this Dockerfile are the source of truth for pinned versions.
+# ======================================================================# VERSION MANAGEMENT
+# ======================================================================# ARG defaults in this Dockerfile are the source of truth for pinned versions.
 # docker/versions.json is auto-generated for use with docker buildx bake.
 #
 # When updating versions:
@@ -20,8 +18,7 @@
 #
 # To build with bake:
 #   docker buildx bake -f docker/docker-bake.hcl -f docker/versions.json
-# =============================================================================
-
+# ======================================================================
 ARG CUDA_VERSION=13.0.3
 ARG PYTHON_VERSION=3.12
 ARG UBUNTU_VERSION=24.04
@@ -184,11 +181,9 @@ RUN gcc --version
 # See: https://docs.nvidia.com/deploy/cuda-compatibility/
 ENV VLLM_ENABLE_CUDA_COMPATIBILITY=0
 
-# ============================================================
-# SLOW-CHANGING DEPENDENCIES BELOW
+# =====================================================# SLOW-CHANGING DEPENDENCIES BELOW
 # These are the expensive layers that we want to cache
-# ============================================================
-
+# =====================================================
 # Install PyTorch and core CUDA dependencies
 # This is ~2GB and rarely changes
 ARG PYTORCH_CUDA_INDEX_BASE_URL
@@ -742,11 +737,9 @@ RUN chmod 0755 /usr/local/bin/vllm-nonroot-entrypoint.sh
 # See: https://docs.nvidia.com/deploy/cuda-compatibility/
 ENV VLLM_ENABLE_CUDA_COMPATIBILITY=0
 
-# ============================================================
-# SLOW-CHANGING DEPENDENCIES BELOW
+# =====================================================# SLOW-CHANGING DEPENDENCIES BELOW
 # These are the expensive layers that we want to cache
-# ============================================================
-
+# =====================================================
 # Install PyTorch and core CUDA dependencies
 # This is ~2GB and rarely changes
 ARG PYTORCH_CUDA_INDEX_BASE_URL
@@ -769,11 +762,9 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     uv pip install --system flashinfer-jit-cache==${FLASHINFER_VERSION} \
         --index-url https://flashinfer.ai/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
 
-# ============================================================
-# OPENAI API SERVER DEPENDENCIES
+# =====================================================# OPENAI API SERVER DEPENDENCIES
 # Pre-install these to avoid reinstalling on every vLLM wheel rebuild
-# ============================================================
-
+# =====================================================
 # Install gdrcopy (saves ~6s per build)
 # TODO (huydhn): There is no prebuilt gdrcopy package on 12.9 at the moment
 ARG GDRCOPY_CUDA_VERSION=12.8
@@ -798,10 +789,8 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     uv pip install --system accelerate 'modelscope<1.38' \
         "timm${TIMM_VERSION}" "runai-model-streamer[s3,gcs,azure]${RUNAI_MODEL_STREAMER_VERSION}"
 
-# ============================================================
-# VLLM INSTALLATION (depends on build stage)
-# ============================================================
-
+# =====================================================# VLLM INSTALLATION (depends on build stage)
+# =====================================================
 FROM vllm-runtime-base AS vllm-base
 
 ARG PIP_INDEX_URL UV_INDEX_URL

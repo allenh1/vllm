@@ -1051,6 +1051,16 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     so map generic sparse-MLA choices to the DSv4-specialized attention class.
     Without an explicit backend, SM12 defaults to FlashInfer while the other
     CUDA arches keep the FlashMLA path.
+
+    An explicit ``--attention-backend FLASHINFER_MLA_SPARSE_DSV4`` selects the
+    FlashInfer TRTLLM-gen path; otherwise the FlashMLA path is used.
+
+    When ``VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE`` is set and the runtime is
+    SM12x with FlashInfer's packed sparse-MLA decode kernel available, decode is
+    routed through the official ``trtllm_batch_decode_sparse_mla_dsv4`` SM120
+    kernel (FlashInfer PR3395) instead of the FlashMLA decode kernel; everything
+    else (packed ``fp8_ds_mla`` cache, metadata, prefill) is unchanged.
+    Default off.
     """
     backend = vllm_config.attention_config.backend
     device_capability = current_platform.get_device_capability()
@@ -1072,6 +1082,20 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
         AttentionBackendEnum.FLASHMLA_SPARSE_DSV4,
     ):
         return DeepseekV4FlashMLAAttention
+
+    if envs.VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE:
+        from vllm.utils.flashinfer import has_flashinfer_trtllm_sparse_mla_dsv4
+
+        if (
+            device_capability is not None
+            and device_capability.major == 12
+            and has_flashinfer_trtllm_sparse_mla_dsv4()
+        ):
+            from vllm.models.deepseek_v4.nvidia.flashinfer_sm120_decode import (
+                DeepseekV4FlashInferSM120Attention,
+            )
+
+            return DeepseekV4FlashInferSM120Attention
 
     if device_capability is not None and device_capability.major == 12:
         return DeepseekV4FlashInferSM120Attention

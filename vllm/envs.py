@@ -200,6 +200,7 @@ if TYPE_CHECKING:
 
     VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL: bool = True
     VLLM_DEEPSEEK_V4_INDEXED_D512_CHUNKED_PREFILL: bool = True
+    VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE: bool = False
     VLLM_TRITON_MLA_SPARSE: bool | None = None
     VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP: bool = True
     VLLM_DCP_Q_REPLICATE: bool = False
@@ -1574,6 +1575,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DEEPSEEK_V4_INDEXED_D512_CHUNKED_PREFILL": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V4_INDEXED_D512_CHUNKED_PREFILL", "1"))
+    ),
+    "VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE", "0"))
     ),
     # Experimental sparse MLA fallback controls.
     # ``VLLM_TRITON_MLA_SPARSE`` unset means auto-select where FlashMLA sparse

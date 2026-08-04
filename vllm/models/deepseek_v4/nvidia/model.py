@@ -1658,6 +1658,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         if self.use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+            if final_aux_mean_pending:
+                # The deferred fused path (DSpark, no MTP buffer) feeds the last
+                # layer's residual streams straight into the post+mean+hc_head
+                # kernel, so they must be gathered to the same row domain as
+                # hidden_states; otherwise the fused kernel asserts a shape mismatch
+                # on its x vs residual token counts under EP+TP+SP.
+                residual = sp_all_gather(residual)[:full_num_tokens]
+                post_mix = sp_all_gather(post_mix)[:full_num_tokens]
+                res_mix = sp_all_gather(res_mix)[:full_num_tokens]
 
         if self._mtp_hidden_buffer is not None:
             assert final_post_materialized

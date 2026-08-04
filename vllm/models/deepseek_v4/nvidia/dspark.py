@@ -62,6 +62,7 @@ from .model import (
     DeepseekV4Model,
     DeepseekV4MoE,
     _select_dsv4_attn_cls,
+    _use_sequence_parallel,
     make_deepseek_v4_expert_params_mapping,
 )
 
@@ -702,7 +703,7 @@ class DeepSeekV4DSpark(nn.Module):
         self.quant_config = get_draft_quant_config(vllm_config)
         self.pad_shared_expert = (
             getattr(self.quant_config, "weight_block_size", None) is not None
-            and not vllm_config.parallel_config.use_sequence_parallel_moe
+            and not _use_sequence_parallel(vllm_config)
         )
         self.dspark_aux_hidden_size = hidden_size * len(self.target_layer_ids)
 

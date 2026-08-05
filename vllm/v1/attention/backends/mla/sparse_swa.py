@@ -511,11 +511,21 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         block_table = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
+        has_prefilling_rows = (
+            common_attn_metadata.is_prefilling is not None
+            and torch.any(common_attn_metadata.is_prefilling).item()
+        )
 
-        # Split into decode and prefill portions using configurable threshold
+        # Split into decode and prefill portions using configurable threshold.
+        # When the batch contains prefill rows, any short extends are
+        # continuations of an in-flight prefill and must stay in the prefill
+        # tier — mirror DeepseekV32IndexerMetadataBuilder so the decode/prefill
+        # boundary (and the top-k computation feeding it) matches on both sides.
         (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens) = (
             split_decodes_and_prefills(
-                common_attn_metadata, decode_threshold=self.decode_threshold
+                common_attn_metadata,
+                decode_threshold=self.decode_threshold,
+                treat_short_extends_as_decodes=not has_prefilling_rows,
             )
         )
 
@@ -533,12 +543,6 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             self.noncausal_index_width if non_causal else self.window_size
         )
         num_tokens = num_decode_tokens + num_prefill_tokens
-        if non_causal:
-            assert self.is_dspark, (
-                "Non-causal DeepseekV4 SWA is only supported for the DSpark "
-                "speculation mode, but causal=False was set without DSpark."
-            )
-        non_causal = not common_attn_metadata.causal
         if non_causal:
             assert self.is_dspark, (
                 "Non-causal DeepseekV4 SWA is only supported for the DSpark "

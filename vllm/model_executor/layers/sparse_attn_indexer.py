@@ -670,8 +670,13 @@ def sparse_attn_indexer(
         used_direct_topk = False
         if (
             not current_platform.is_xpu()
+            and decode_metadata.global_seq_lens is None
             and logits_bytes > sparse_indexer_max_logits_bytes()
         ):
+            # The direct top-k kernel never materializes per-position scores,
+            # but _merge_dcp_topk_global below needs the full local logits to
+            # merge candidates across DCP ranks — fall back to the logits path
+            # whenever DCP is active so the merge sees a real score matrix.
             used_direct_topk = fp8_fp4_paged_mqa_topk_indices(
                 (padded_q_quant_cast, padded_q_scale),
                 kv_cache,

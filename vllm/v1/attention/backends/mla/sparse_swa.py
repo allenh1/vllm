@@ -25,9 +25,6 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
-from vllm.v1.attention.backends.mla.compressor_utils import (
-    get_dspark_swa_index_width,
-)
 from vllm.v1.attention.backends.mla.sparse_mla_env import (
     is_triton_sparse_mla_enabled,
 )
@@ -478,14 +475,15 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # DSpark draft: the block is non-causal (every query attends to the
         # trailing window of context PLUS all query tokens, including future ones),
         # so its per-token index list is wider than `window_size`. The kernel pads
-        # the q-head count to B_TOPK. Pad to a kernel-supported width; the logical
-        # SWA window remains unchanged when the padded matrix is built.
+        # the q-head count to B_TOPK (64/128), which requires the index width to be
+        # a multiple of 128.
+        spec_config = self.vllm_config.speculative_config
+        num_spec_tokens = (
+            spec_config.num_speculative_tokens if spec_config is not None else 0
+        )
         self.is_dspark = spec_config is not None and spec_config.use_dspark()
         self.noncausal_index_width = (
-            get_dspark_swa_index_width(
-                self.window_size,
-                self.num_speculative_tokens,
-            )
+            cdiv(self.window_size + num_spec_tokens, 128) * 128
             if self.is_dspark
             else 0
         )

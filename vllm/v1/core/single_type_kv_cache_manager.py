@@ -868,9 +868,15 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         self,
         request: Request,
         num_tokens: int,
+        alignment_tokens: int | None = None,
         retention_interval: int | None = None,
     ) -> None:
-        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
+        super().cache_blocks(
+            request,
+            num_tokens,
+            alignment_tokens=alignment_tokens,
+            retention_interval=retention_interval,
+        )
         hash_block_size = self.block_pool.hash_block_size
         if self.block_size == hash_block_size:
             return

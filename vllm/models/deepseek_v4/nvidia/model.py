@@ -1199,10 +1199,11 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
             and has_flashinfer_trtllm_sparse_mla_dsv4()
         ):
             from vllm.models.deepseek_v4.nvidia.flashinfer_sm120_decode import (
-                DeepseekV4FlashInferSM120Attention,
+                DeepseekV4FlashInferSM120Attention as
+                DeepseekV4FlashInferSM120DecodeAttention,
             )
 
-            return DeepseekV4FlashInferSM120Attention
+            return DeepseekV4FlashInferSM120DecodeAttention
 
     if device_capability is not None and device_capability.major == 12:
         return DeepseekV4FlashInferSM120Attention

@@ -760,6 +760,21 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             raise RuntimeError(
                 "Compressed sparse MLA decode requires compressed sparse indices."
             )
+        # FlashInfer's SM120 sparse-MLA C++ orchestrator requires fully
+        # contiguous index panels ("eidx must be contiguous"). The metadata
+        # builder hands back column-sliced views of a wider preallocated
+        # buffer (e.g. c128a_global_decode_topk_indices / global_indices
+        # views), which trip that check. Normalize before launch, mirroring
+        # flashinfer_sm120_decode.py. .contiguous() is a no-op when already
+        # contiguous, so there is no overhead on the hot path.
+        if swa_indices is not None:
+            swa_indices = swa_indices.contiguous()
+        if swa_lens is not None:
+            swa_lens = swa_lens.contiguous()
+        if extra_sparse_indices is not None:
+            extra_sparse_indices = extra_sparse_indices.contiguous()
+        if extra_sparse_lengths is not None:
+            extra_sparse_lengths = extra_sparse_lengths.contiguous()
         flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
             query=q,
             swa_kv_cache=swa_cache,

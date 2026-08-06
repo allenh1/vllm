@@ -282,21 +282,60 @@ def _deepseek_v4_structured_output_bitmask_warmup(
 
     bitmask_width = (vocab_size + 31) // 32
     req_id = "_deepseek_v4_warmup_"
-    grammar_bitmask = np.full((1, bitmask_width), fill_value=-1, dtype=np.int32)
-    grammar_output = GrammarOutput(
-        structured_output_request_ids=[req_id], grammar_bitmask=grammar_bitmask
-    )
+
+    # xgrammar's apply_token_bitmask_inplace kernel specializes on the number
+    # of logit rows (num_rows), the logits pointer dtype, and whether an
+    # indices tensor is supplied. Triton classifies the scalar row count as
+    # ``== 1``, ``% 16 == 0``, or neither, so one representative of each class
+    # covers every batch size the sampler can emit (single-request decode up
+    # to max_num_seqs, and 16 rows for the 16-divisible class).
+    all_structured_ids = [
+        req_id, *[f"{req_id}_u{i}" for i in range(31)]
+    ]
 
     for dtype in dtypes:
-        for req_ids in ([req_id], [req_id, "_deepseek_v4_warmup_unmasked_"]):
+        # indices=None path: every logit row is a structured request.
+        for num_reqs in (1, 2, 16):
+            req_ids = all_structured_ids[:num_reqs]
             logits = torch.zeros(
-                (len(req_ids), vocab_size), dtype=dtype, device=runner.device
+                (num_reqs, vocab_size), dtype=dtype, device=runner.device
             )
-            input_batch = SimpleNamespace(req_ids=req_ids)
+            g_output = GrammarOutput(
+                structured_output_request_ids=req_ids,
+                grammar_bitmask=np.full(
+                    (num_reqs, bitmask_width), fill_value=-1, dtype=np.int32
+                ),
+            )
             apply_grammar_bitmask(
                 SchedulerOutput.make_empty(),
-                grammar_output,
-                input_batch,  # type: ignore[arg-type]
+                g_output,
+                SimpleNamespace(req_ids=req_ids),  # type: ignore[arg-type]
+                logits,
+            )
+
+        # indices-present path: a mix of structured and unstructured rows.
+        # xgrammar sizes the kernel by len(indices); the unstructured tail row
+        # keeps the existing 1-row "unmasked" variant while covering the plain
+        # and 16-divisible index counts.
+        for num_structured in (1, 2, 16):
+            num_rows = num_structured + 1
+            structured_ids = all_structured_ids[:num_structured]
+            req_ids = [*structured_ids, f"{req_id}_unmasked"]
+            logits = torch.zeros(
+                (num_rows, vocab_size), dtype=dtype, device=runner.device
+            )
+            g_output = GrammarOutput(
+                structured_output_request_ids=structured_ids,
+                grammar_bitmask=np.full(
+                    (num_structured, bitmask_width),
+                    fill_value=-1,
+                    dtype=np.int32,
+                ),
+            )
+            apply_grammar_bitmask(
+                SchedulerOutput.make_empty(),
+                g_output,
+                SimpleNamespace(req_ids=req_ids),  # type: ignore[arg-type]
                 logits,
             )
 
@@ -336,6 +375,7 @@ def _run_deepseek_v4_mtp_spec_decode_warmup_kernels(
     block_size: int,
     max_model_len: int,
     hidden_size: int,
+    warm_mtp_shared_head: bool = True,
 ) -> None:
     from vllm.v1.sample.logits_processor import LogitsProcessors
     from vllm.v1.sample.metadata import SamplingMetadata
@@ -482,22 +522,223 @@ def _run_deepseek_v4_mtp_spec_decode_warmup_kernels(
 
     # _mtp_shared_head_rmsnorm_kernel: the MTP shared-head RMSNorm is not driven by
     # any dummy run, so it JITs on the first MTP step. Direct-launch it (its only
-    # compile key is hidden_size, so one call covers the model).
+    # compile key is hidden_size, so one call covers the model). DSpark has no
+    # MTP shared head, so the caller skips this for method == "dspark".
+    if warm_mtp_shared_head:
+        try:
+            from vllm.models.deepseek_v4.common.ops.fused_mtp_input_rmsnorm import (
+                mtp_shared_head_rmsnorm,
+            )
+
+            hs = torch.randn(
+                num_reqs * num_sampled_tokens,
+                hidden_size,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            norm_w = torch.ones(hidden_size, dtype=torch.bfloat16, device=device)
+            mtp_shared_head_rmsnorm(hs, norm_w, 1e-6)
+        except Exception as exc:  # noqa: BLE001 - warmup must never break startup
+            logger.warning("DeepSeek V4 MTP shared-head RMSNorm warmup skipped: %s",
+                           exc)
+
+
+def _is_deepseek_v4_dspark_spec_decode(runner: "GPUModelRunner") -> bool:
+    spec_config = getattr(runner, "speculative_config", None)
+    return (
+        getattr(spec_config, "method", None) == "dspark"
+        and getattr(runner, "num_spec_tokens", 0) > 0
+    )
+
+
+# Request-count representatives whose specialization classes (== 1, % 16 == 0,
+# neither) cover every scheduler batch for the DSpark draft kernels and the
+# spec-decode prep/rejection kernels below.
+_DSPARK_SPEC_DECODE_WARMUP_REQS = (1, 5, 16)
+_DSPARK_CONTEXT_KV_STORE_WARMUP_TOKENS_PER_REQ = 4
+
+
+def _deepseek_v4_dspark_kernel_warmup(runner: "GPUModelRunner") -> None:
+    """Force-compile DSpark fused Markov sampler + context KV-store kernels.
+
+    The DSv4 warmup's dummy runs never exercise DSpark drafting: ``dummy_run``
+    only walks the draft *forward*, and draft sampling only happens inside
+    ``propose()`` at inference. ``_dspark_context_kv_store_kernel`` is also
+    only ever launched with ``(batch_size=1, has_rejected=False)`` by the
+    warmup dummy, while the runtime calls it with the real request batch and
+    ``has_rejected=True`` (``prepare_inputs_padded`` always hands a non-None
+    rejected-count tensor) -- and ``batch_size``/``has_rejected`` are
+    ``constexpr`` in the kernel. ``num_tokens`` is only a grid dimension, so
+    any context length per call works.
+    """
+    get_draft_model = getattr(runner, "get_draft_model", None)
+    draft = get_draft_model() if get_draft_model is not None else None
+    if draft is None or not hasattr(draft, "apply_dspark_markov_bias"):
+        return
+
     try:
-        from vllm.models.deepseek_v4.common.ops.fused_mtp_input_rmsnorm import (
-            mtp_shared_head_rmsnorm,
+        from vllm.models.deepseek_v4.nvidia.dspark import DeepSeekV4DSparkLayer
+        from vllm.models.deepseek_v4.nvidia.dspark_triton import (
+            dspark_context_kv_store,
+            dspark_markov_probs_sample,
+        )
+    except ImportError as exc:
+        logger.warning(
+            "Skipping DeepSeek V4 DSpark kernel warmup: a required symbol failed "
+            "to import (%s); the first DSpark decode step will JIT it.",
+            exc,
+        )
+        return
+
+    device = runner.device
+    max_num_seqs = max(1, int(runner.scheduler_config.max_num_seqs))
+
+    try:
+        # --- Fused Markov sampler -------------------------------------------
+        # step_logits width is the draft head's gathered-vocab width; batch and
+        # context are grid-only, so all batch sizes share one compile per
+        # (vocab, logits dtype, is_greedy presence).
+        vocab_size = int(draft.config.vocab_size)
+        num_blocks = (vocab_size + 1024 - 1) // 1024
+        scratch = {
+            name: torch.empty(
+                (2, num_blocks), dtype=dtype, device=device
+            )
+            for name, dtype in (
+                ("block_max", torch.float32),
+                ("block_sumexp", torch.float32),
+                ("block_gval", torch.float32),
+                ("block_maxid", torch.int32),
+                ("block_gid", torch.int32),
+            )
+        }
+        scratch["row_max"] = torch.empty((2,), dtype=torch.float32, device=device)
+        scratch["row_invz"] = torch.empty((2,), dtype=torch.float32, device=device)
+        inv_temp = torch.full((2,), 1.0, dtype=torch.float32, device=device)
+        is_greedy = torch.zeros((2,), dtype=torch.int32, device=device)
+        tokens = torch.empty((2,), dtype=torch.int64, device=device)
+        # Runtime default is bf16 step_logits (markov bias in-place add); the
+        # top-k/top-p path upcasts to fp32 first, so warm both pointer dtypes.
+        for logits_dtype in (torch.bfloat16, torch.float32):
+            step_logits = torch.zeros(
+                (2, vocab_size), dtype=logits_dtype, device=device
+            )
+            probs = torch.zeros(
+                (2, vocab_size), dtype=torch.float32, device=device
+            )
+            dspark_markov_probs_sample(
+                step_logits,
+                inv_temp,
+                is_greedy,
+                tokens,
+                probs,
+                scratch,
+                0,
+                block_v=1024,
+            )
+
+        # --- Draft context KV store -------------------------------------------
+        layers = [
+            module
+            for module in draft.modules()
+            if isinstance(module, DeepSeekV4DSparkLayer)
+        ]
+        if layers:
+            layer = layers[0]
+            head_dim = int(layer.attn.head_dim)
+            window_size = int(layer.window_size)
+            kv_weight = layer.attn.kv_norm.weight.data
+            cos_sin_cache = layer.attn.rotary_emb.cos_sin_cache
+            eps = float(layer.attn.eps)
+            tokens_per_req = _DSPARK_CONTEXT_KV_STORE_WARMUP_TOKENS_PER_REQ
+            cache = torch.empty(
+                (max_num_seqs, window_size, head_dim),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            kv = torch.zeros(
+                (max_num_seqs * tokens_per_req, head_dim),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            positions = torch.arange(
+                kv.shape[0], dtype=torch.int64, device=device
+            )
+            for batch_size in range(1, max_num_seqs + 1):
+                num_tokens = batch_size * tokens_per_req
+                query_start_loc = torch.arange(
+                    batch_size + 1, dtype=torch.int32, device=device
+                ) * tokens_per_req
+                rejected = torch.zeros(
+                    batch_size, dtype=torch.int32, device=device
+                )
+                dspark_context_kv_store(
+                    kv[:num_tokens],
+                    cache[:batch_size],
+                    positions[:num_tokens],
+                    query_start_loc,
+                    batch_size,
+                    rejected,
+                    kv_weight,
+                    cos_sin_cache,
+                    eps,
+                )
+            # has_rejected=False variant (first-pass with no rejected slot).
+            dspark_context_kv_store(
+                kv[:tokens_per_req],
+                cache[:1],
+                positions[:tokens_per_req],
+                torch.tensor([0, tokens_per_req], dtype=torch.int32,
+                             device=device),
+                1,
+                None,
+                kv_weight,
+                cos_sin_cache,
+                eps,
+            )
+
+        torch.accelerator.synchronize()
+    except Exception as exc:  # noqa: BLE001 - warmup must never break startup
+        logger.warning(
+            "DeepSeek V4 DSpark kernel warmup skipped after error "
+            "(the first DSpark decode step may JIT in-inference): %s",
+            exc,
         )
 
-        hs = torch.randn(
-            num_reqs * num_sampled_tokens,
-            hidden_size,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        norm_w = torch.ones(hidden_size, dtype=torch.bfloat16, device=device)
-        mtp_shared_head_rmsnorm(hs, norm_w, 1e-6)
+
+def _deepseek_v4_dspark_spec_decode_kernel_warmup(runner: "GPUModelRunner") -> None:
+    """Compile the shared spec-decode prep/rejection kernels for DSpark.
+
+    The MTP uniform-decode ladder is MTP-only, so DSpark never compiles
+    ``eagle_prepare_next_token_padded_kernel``, ``eagle_prepare_inputs_padded_kernel``,
+    ``rejection_random_sample_kernel``, ``sample_recovered_tokens_kernel`` or
+    ``rejection_greedy_sample_kernel`` before the first inference step. The
+    spec-decode machinery is method-agnostic, so drive the same direct kernel
+    warmup the MTP path uses, at request-count representatives covering every
+    Triton specialization class.
+    """
+    if not _is_deepseek_v4_dspark_spec_decode(runner):
+        return
+    try:
+        vocab_size = runner.model_config.get_vocab_size()
+        block_size = getattr(runner.cache_config, "block_size", None) or 16
+        for num_reqs in _DSPARK_SPEC_DECODE_WARMUP_REQS:
+            _run_deepseek_v4_mtp_spec_decode_warmup_kernels(
+                device=runner.device,
+                num_reqs=num_reqs,
+                num_spec_tokens=runner.num_spec_tokens,
+                vocab_size=vocab_size,
+                block_size=block_size,
+                max_model_len=runner.max_model_len,
+                hidden_size=runner.model_config.get_hidden_size(),
+                warm_mtp_shared_head=False,
+            )
     except Exception as exc:  # noqa: BLE001 - warmup must never break startup
-        logger.warning("DeepSeek V4 MTP shared-head RMSNorm warmup skipped: %s", exc)
+        logger.warning(
+            "DeepSeek V4 DSpark spec-decode kernel warmup skipped after error "
+            "(the first DSpark decode step may JIT in-inference): %s",
+            exc,
+        )
 
 
 def _deepseek_v4_indexed_d512_split_prefill_warmup(runner: "GPUModelRunner") -> None:
@@ -909,6 +1150,185 @@ def _deepseek_v4_paged_mqa_rowwise_decode_warmup(runner: "GPUModelRunner") -> No
         )
 
 
+def _deepseek_v4_mqa_dense_prefill_warmup(runner: "GPUModelRunner") -> None:
+    """Force-compile the dense (non-paged) SM12x MQA logits kernels.
+
+    The prefill indexer computes top-k over the *dense* compressed KV of each
+    prefill chunk (``fp8_fp4_mqa_topk_indices`` -> ``fp8_mqa_logits_triton`` ->
+    ``_fp8_mqa_logits_kernel``). No warmup dummy drives prefill top-k (the
+    existing paged-MQA warmup only covers the decode-side rowwise kernel), so
+    the first prefill step JITs ``_fp8_mqa_logits_kernel``. The kernel's
+    constexprs are the head geometry, the buffer strides and ``BLOCK_M``
+    (= 16 or 64 depending on whether the compressed-KV length exceeds 16K);
+    ``num_q``/``seq_len_kv`` only size the grid, so two representative calls
+    (one per BLOCK_M class) cover every prefill chunk.
+
+    Also warms ``compute_global_topk_indices_and_lens``
+    (``_compute_global_topk_indices_and_lens_kernel``), which maps the indexer
+    top-k down to global KV slots on the decode side (cr=4 layer): its compile
+    key is the top-k width / block-table width / kv block size, all fixed by
+    the model geometry, so one call suffices.
+    """
+    try:
+        from vllm.models.deepseek_v4.attention import DeepseekV4Indexer
+        from vllm.models.deepseek_v4.common.ops.cache_utils import (
+            compute_global_topk_indices_and_lens,
+        )
+        from vllm.models.deepseek_v4.nvidia.ops.sm12x_mqa import (
+            fp8_mqa_logits_triton,
+        )
+        from vllm.v1.attention.backends.mla.indexer import (
+            DeepseekV32IndexerMetadataBuilder,
+        )
+        from vllm.v1.worker.cp_utils import get_kv_cache_shard_count
+    except ImportError as exc:
+        logger.warning(
+            "Skipping SM12x dense MQA prefill warmup: a required symbol failed "
+            "to import (%s); the first prefill may JIT it in-inference.",
+            exc,
+        )
+        return
+
+    if not (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+    ):
+        return
+
+    try:
+        from vllm.utils.math_utils import cdiv
+
+        indexers = [
+            module
+            for module in runner.get_model().modules()
+            if isinstance(module, DeepseekV4Indexer)
+        ]
+        cr4 = next(
+            (
+                module
+                for module in indexers
+                if not module.use_fp4_kv and module.compress_ratio == 4
+            ),
+            None,
+        )
+        if cr4 is None:
+            return
+
+        device = cr4.wq_b.weight.device
+        num_heads = int(cr4.n_head)
+        head_dim = int(cr4.head_dim)
+
+        # Dense MQA logits: q is [M, heads, dim] fp8 with the row stride of the
+        # padded quant buffer (heads == padded heads here on SM120); k is the
+        # per-chunk compressed KV [N, dim].
+        fp8_dtype = torch.float8_e4m3fn
+        for seq_len_kv in (1024, 16385):
+            q = torch.zeros(
+                (1, num_heads, head_dim), dtype=fp8_dtype, device=device
+            )
+            k_fp8 = torch.zeros(
+                (seq_len_kv, head_dim), dtype=fp8_dtype, device=device
+            )
+            k_scale = torch.zeros(
+                (seq_len_kv,), dtype=torch.float32, device=device
+            )
+            weights = torch.zeros(
+                (1, num_heads), dtype=torch.float32, device=device
+            )
+            cu_ks = torch.zeros((1,), dtype=torch.int32, device=device)
+            cu_ke = torch.full(
+                (1,), seq_len_kv, dtype=torch.int32, device=device
+            )
+            fp8_mqa_logits_triton(
+                q, (k_fp8, k_scale), weights, cu_ks, cu_ke
+            )
+
+        # Global top-k -> KV-slot mapping for decode (cr=4 only; cr=128 uses a
+        # precomputed path). The widths are model-fixed, so one warm call.
+        topk = int(cr4.topk_tokens)
+        kv_block_size = max(
+            1,
+            runner.cache_config.block_size // int(cr4.compress_ratio),
+        )
+        bt_widths: set[int] = set()
+        for group_list in getattr(runner, "attn_groups", []):
+            for group in group_list:
+                for builder in getattr(group, "metadata_builders", []):
+                    if isinstance(builder, DeepseekV32IndexerMetadataBuilder):
+                        bt_widths.add(
+                            int(builder.expanded_block_table_buffer.stride(0))
+                        )
+        bt_widths.add(
+            cdiv(
+                runner.max_model_len,
+                runner.cache_config.block_size * get_kv_cache_shard_count(),
+            )
+        )
+        bt_width = max(bt_widths, default=1) if bt_widths else 1
+        num_tokens = 2
+        topk_indices = torch.zeros(
+            (num_tokens, topk), dtype=torch.int32, device=device
+        )
+        token_to_req = torch.zeros((num_tokens,), dtype=torch.int32, device=device)
+        block_table = torch.zeros(
+            (1, bt_width), dtype=torch.int32, device=device
+        )
+        is_valid = torch.ones((num_tokens,), dtype=torch.bool, device=device)
+        compute_global_topk_indices_and_lens(
+            topk_indices,
+            token_to_req,
+            block_table,
+            kv_block_size,
+            is_valid,
+        )
+
+        torch.accelerator.synchronize()
+    except Exception as exc:  # noqa: BLE001 - warmup must never break startup
+        logger.warning(
+            "SM12x dense MQA prefill warmup skipped after error "
+            "(the first prefill/decode may JIT it in-inference): %s",
+            exc,
+        )
+
+
+# M values whose LM-head block-scaled MM config must be warmed. The tuned
+# w8a8-block config is picked by nearest M bin (1/2/4/8/16/24/32/48/...), so
+# each scheduled batch size lands on a distinct constexpr combo: cover the
+# single-request prefill final sample (M=1) and every decode-batch bin up to
+# the DSpark/max-num-seqs decode range.
+_DEEPSEEK_V4_LOGITS_WARMUP_M = (1, 2, 4, 8, 16, 24, 32, 48)
+
+
+def _deepseek_v4_logits_warmup(runner: "GPUModelRunner") -> None:
+    """Warm the LM-head block-scaled MM at the sampler's real M values.
+
+    The prefill dummy runs never call ``compute_logits``, so the logits layer
+    (``_w8a8_triton_block_scaled_mm`` on the unquantized-vocab LM head) only
+    ever compiles at the ``_dummy_sampler_run`` M from ``profile_run`` (=
+    ``min(max_num_seqs, max_num_batched_tokens)``). The first request prefills
+    at M=1 (single-request final sample) and decode steps run at the batch
+    size, so those M bins JIT on the first request. Drive the real logits
+    path (including TP logits gather and top-k/top-p sampling) at
+    representative M values that cover every Triton specialization class.
+    """
+    try:
+        hidden_size = runner.model_config.get_hidden_size()
+        for num_tokens in _DEEPSEEK_V4_LOGITS_WARMUP_M:
+            hidden_states = torch.randn(
+                (num_tokens, hidden_size),
+                dtype=runner.model_config.dtype,
+                device=runner.device,
+            )
+            runner._dummy_sampler_run(hidden_states)
+        torch.accelerator.synchronize()
+    except Exception as exc:  # noqa: BLE001 - warmup must never break startup
+        logger.warning(
+            "DeepSeek V4 logits warmup skipped after error "
+            "(the first request may JIT the LM head in-inference): %s",
+            exc,
+        )
+
+
 def _deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
     if not envs.VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP:
         return
@@ -980,8 +1400,10 @@ def _deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
 
     # Same class of gap on the decode side: the decode dummies below run with
     # seq_lens == max_query_len, so the indexer short-circuits and never
-    # reaches the paged-MQA logits kernel.
+    # reaches the paged-MQA logits kernel (or, on the prefill side, the dense
+    # MQA logits / global-topk kernels).
     _deepseek_v4_paged_mqa_rowwise_decode_warmup(runner)
+    _deepseek_v4_mqa_dense_prefill_warmup(runner)
 
     query_len = getattr(runner, "uniform_decode_query_len", 0)
     for num_reqs in uniform_decode_reqs:
@@ -1013,6 +1435,38 @@ def _deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
                 hidden_size=runner.model_config.get_hidden_size(),
             )
         torch.accelerator.synchronize()
+
+    # DSpark is spec-decode, but its draft kernels are never reached by the
+    # MTP uniform-decode ladder above (and DSpark does not run the
+    # MTP uniform-decode dummy at all). Warm the method-specific kernels
+    # (Markov sampler, context KV store) and the shared spec-decode
+    # prep/rejection kernels.
+    if current_platform.is_cuda_alike():
+        _deepseek_v4_dspark_kernel_warmup(runner)
+        _deepseek_v4_dspark_spec_decode_kernel_warmup(runner)
+
+    # mHC TileLang kernels JIT whenever a launch's split-k band was not warmed
+    # at startup (see deepseek_v4_mhc_warmup). Drive the real NVIDIA wrappers
+    # over every reachable band.
+    if current_platform.is_cuda():
+        from vllm.model_executor.warmup.deepseek_v4_mhc_warmup import (
+            deepseek_v4_mhc_warmup,
+        )
+
+        get_draft_model = getattr(runner, "get_draft_model", None)
+        deepseek_v4_mhc_warmup(
+            runner.get_model(),
+            draft_model=get_draft_model() if get_draft_model is not None else None,
+            max_tokens=max_tokens,
+        )
+
+    # The mHC warmup above compiles the tf32 HC prenorm GEMM for the mHC
+    # kernels' band; warm the LM-head block-scaled MM at the sampler's real
+    # M bins (M=1 for the single-request prefill final sample, 16/48 for
+    # decode batches) via the real compute_logits path, which the prefill
+    # dummy runs never reach.
+    if current_platform.is_cuda_alike() and prefill_tokens > 0:
+        _deepseek_v4_logits_warmup(runner)
 
 
 def _ll_bf16_router_shapes_from_model(

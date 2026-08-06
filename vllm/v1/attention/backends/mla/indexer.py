@@ -370,7 +370,12 @@ class BuildPrefillChunkMetadataKernel(
             for ratio in (getattr(hf_config, "compress_ratios", None) or (1,))
         )
         return self._trace_dispatch(self.dispatch)(
-            query_slice_start=WarmupIntRange(0, 2),
+            # query_slice_start is a non-constexpr Triton arg specialized on
+            # its divisibility class (== 1, % 16 == 0, otherwise plain); the
+            # windowed sub-chunks of a long chunked prefill pass arbitrary
+            # starts, so cover the plain class too (0 -> %16, 1 -> ==1,
+            # 2 -> plain).
+            query_slice_start=WarmupIntRange(0, 3),
             query_slice_stop=(1, 2 * max_tokens - 1, 2 * max_tokens),
             DCP_RANK=dcp_rank,
             DCP_WORLD=dcp_world,

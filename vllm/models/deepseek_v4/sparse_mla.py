@@ -232,10 +232,24 @@ class DeepseekV4SparseMLAMetadataBuilder(
         # `c128a_global_decode_topk_indices.shape[0]` lines up with q in
         # `_forward_decode`. The per-token C128A kernel handles non-uniform
         # query lengths.
+        # Mirror DeepseekSparseSWAMetadataBuilder's split: when the batch
+        # contains prefill rows, short extends (query_len <= decode_threshold
+        # but still prefilling) must stay in the prefill tier. The counterpart
+        # sparse cache layer consumes swa_metadata.num_prefill_tokens and
+        # expects c128a_prefill_topk_indices to be filled for every token SWA
+        # classifies as prefill. Using the default
+        # treat_short_extends_as_decodes=True here splits differently than SWA,
+        # leaving c128a_prefill_topk_indices None for a mixed short-extend
+        # prefill batch -> "Compressed sparse MLA prefill requires compressed
+        # sparse indices.". See DeepseekSparseSWAMetadataBuilder.build.
+        has_prefilling_rows = (
+            cm.is_prefilling is not None and torch.any(cm.is_prefilling).item()
+        )
         (num_decodes, _, num_decode_tokens, num_prefill_tokens) = (
             split_decodes_and_prefills(
                 cm,
                 decode_threshold=self.reorder_batch_threshold or 1,
+                treat_short_extends_as_decodes=not has_prefilling_rows,
             )
         )
 

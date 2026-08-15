@@ -1591,6 +1591,10 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         max_tokens = worker.scheduler_config.max_num_batched_tokens
         deep_gemm_warmup(model, max_tokens)
 
+    compilation_config = worker.vllm_config.compilation_config
+    cudagraph_capture_sizes = list(
+        compilation_config.cudagraph_capture_sizes or []
+    )
     b12x_warmup(worker, cudagraph_capture_sizes)
 
     minimax_m3_msa_warmup(worker)

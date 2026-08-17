@@ -727,14 +727,15 @@ def _tf32_hc_prenorm_gemm_sm12x(
 # SM12x MegaMoE orchestration
 # ---------------------------------------------------------------------------
 # The fused tcgen05 MegaMoE kernel is SM100-only; GB10 (SM121) has no tcgen05
-# or tensor memory. This fallback reproduces the MegaMoE dataflow on SM12x
-# using the SM120 DeepGEMM grouped-gemm kernels:
+# or tensor memory. This fallback reproduces the MegaMoE dataflow on SM12x:
 #
 #   topk dispatch (one packed NCCL all-to-all across the EP group; the
 #   symmetric-buffer transport requires intra-node NVLink and cannot work on
-#   1-GPU-per-node clusters) -> sorted grouped L1 (FP8 x FP4) -> swiglu +
-#   clamp -> FP8/UE8M0 activation quantization -> grouped L2 (FP8 x FP4) ->
-#   reverse all-to-all -> topk-weighted scatter combine.
+#   1-GPU-per-node clusters) -> sorted fused local compute (the native SM120
+#   `sm120_fp8_fp4_mega_moe` kernel: L1 (FP8xFP8, pre-scaled weights) ->
+#   swiglu + clamp -> per-64 FP8/UE8M0 activation quantization -> L2 with
+#   fp32 scale folding -> reverse scatter by pair id) -> reverse all-to-all
+#   -> topk-weighted scatter combine.
 #
 # All tensor shapes are static (capped by max_num_tokens * top_k) so the
 # path stays cudagraph-capturable; rows beyond the real counts are
@@ -742,94 +743,140 @@ def _tf32_hc_prenorm_gemm_sm12x(
 
 from vllm.triton_utils import tl, triton
 
+_E2M1_DECODE_F32 = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+    dtype=torch.float32,
+)
+
 _MEGA_MOE_ALIGN = 128  # DeepGEMM MGroupedContiguous M alignment
 _MEGA_MOE_BLOCK_ROWS = 64
 
 
 @triton.jit
-def _mega_swiglu_quant_kernel(
-    d1_ptr, act_ptr, sf_ptr,
-    num_rows,
-    TWO_I: tl.constexpr, CHUNK: tl.constexpr,
-    HAS_CLAMP: tl.constexpr, CLAMP: tl.constexpr,
-    BLOCK_ROWS: tl.constexpr,
+def _mega_fold_x_sf_kernel(
+    x_ptr, sf_ptr, out_ptr,
+    H: tl.constexpr, CHUNK: tl.constexpr,
 ):
-    """swiglu (interleaved gate/up gran-8) + per-32 FP8/UE8M0 quantization.
+    """Fold the per-128 UE8M0 scales into FP8 x bytes.
 
-    d1: [P, 2I] bf16 with gate/up interleaved as [g0..7, u0..7, g8..15, ...].
-    act: [P, I] fp8 e4m3fn. sf: [P, I/32] fp32 powers of two (UE8M0-valued;
-    the grouped-gemm API casts them to packed UE8M0 internally). Zero blocks
-    emit sf = 1.0 (UE8M0 byte 0 is invalid on SM120 hardware).
+    x: [rows, H] fp8 viewed as uint8; sf: [rows, H/128] int32 UE8M0 words.
+    The fold is an exact e4m3 exponent shift (2^k), clamped to zero on
+    underflow and to the e4m3 max (448) on overflow.
     """
-    pid = tl.program_id(0)
-    rows = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    rmask = rows < num_rows
-    # gate/up are interleaved in 16-column blocks [g0..7, u0..7]
-    blk = tl.arange(0, CHUNK // 16)
-    w8 = tl.arange(0, 8)
-    gcols = blk[None, :, None] * 16 + w8[None, None, :]
-    ucols = blk[None, :, None] * 16 + 8 + w8[None, None, :]
-    for c in tl.static_range(TWO_I // CHUNK):
-        base = c * CHUNK
-        row_base = rows[:, None, None] * TWO_I + base
-        gate = tl.load(
-            d1_ptr + row_base + gcols, mask=rmask[:, None, None], other=0.0,
-        ).to(tl.float32)
-        up = tl.load(
-            d1_ptr + row_base + ucols, mask=rmask[:, None, None], other=0.0,
-        ).to(tl.float32)
-        gate = tl.reshape(gate, (BLOCK_ROWS, CHUNK // 2))
-        up = tl.reshape(up, (BLOCK_ROWS, CHUNK // 2))
-        if HAS_CLAMP:
-            gate = tl.minimum(tl.maximum(gate, -CLAMP), CLAMP)
-        act = gate * tl.sigmoid(gate) * up
-        a3 = tl.reshape(act, (BLOCK_ROWS, CHUNK // 64, 32))
-        mx = tl.max(tl.abs(a3), axis=2)
-        e = tl.math.ceil(tl.math.log2(tl.maximum(mx, 2.0 ** -126)))
-        e = tl.where(mx > 0, e, 0.0)
-        sf = tl.math.exp2(e)
-        q = tl.reshape(a3 / sf[:, :, None], (BLOCK_ROWS, CHUNK // 2))
-        out_col = c * (CHUNK // 2)
-        half_cols = tl.arange(0, CHUNK // 2)
-        tl.store(
-            act_ptr + rows[:, None] * (TWO_I // 2) + (out_col + half_cols)[None, :],
-            q.to(tl.float8e4nv), mask=rmask[:, None],
+    row = tl.program_id(0)
+    for c in tl.static_range(H // CHUNK):
+        offs = c * CHUNK + tl.arange(0, CHUNK)
+        g = offs // 128
+        b = (offs % 128) // 32
+        sf = tl.load(sf_ptr + row * (H // 128) + g)
+        k = ((sf >> (b * 8)) & 0xFF).to(tl.int32) - 127
+        xb = tl.load(x_ptr + row * H + offs).to(tl.int32)
+        field = (xb >> 3) & 0xF
+        sign = xb & 0x80
+        is_zero = (xb & 0x7F) == 0
+        nf = field + k
+        out_b = tl.where(
+            is_zero, sign,
+            tl.where(
+                nf <= 0, sign,
+                tl.where(
+                    nf >= 15, sign | 0x7E,
+                    (xb & 0x87) | ((nf & 0xF) << 3),
+                ),
+            ),
         )
-        sf_col = c * (CHUNK // 64)
-        quarter_cols = tl.arange(0, CHUNK // 64)
-        tl.store(
-            sf_ptr + rows[:, None] * (TWO_I // 64) + (sf_col + quarter_cols)[None, :],
-            sf, mask=rmask[:, None],
-        )
+        tl.store(out_ptr + row * H + offs, out_b.to(tl.uint8))
 
 
-_mega_moe_sf_fp32_cache: dict[tuple[int, tuple[int, ...]], torch.Tensor] = {}
+def _mega_moe_deinterleave_weights(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
+    """Inverse of deep_gemm's `_interleave_weights`:
+    [g0..7, u0..7, g8..15, u8..15, ...] -> [gate | up] along the N dim."""
+    assert t.dim() in (2, 3)
+    squeeze_group_dim = t.dim() == 2
+    if squeeze_group_dim:
+        t = t.unsqueeze(0)
+    g, n, *rest = t.shape
+    half = n // 2
+    paired = t.reshape(g, half // gran, 2, gran, *rest)
+    gate = paired[:, :, 0].reshape(g, half, *rest)
+    up = paired[:, :, 1].reshape(g, half, *rest)
+    result = torch.cat([gate, up], dim=1).contiguous()
+    return result.squeeze(0) if squeeze_group_dim else result
 
 
-def _mega_moe_sf_int32_to_fp32(
-    sf_int32: torch.Tensor, cached: bool = True
-) -> torch.Tensor:
-    """Convert packed-UE8M0 SF (int32, k-major, 4 consecutive k-groups per
-    word) to the fp32 per-gran form consumed by the grouped-gemm SF
-    transform.
+def _mega_moe_untranspose_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
+    """Inverse of deep_gemm's `_transpose_sf_for_utccp` (reshape to the
+    (32, 4) block form and transpose back)."""
+    assert sf.dtype == torch.int and sf.dim() in (2, 3)
+    squeeze_group_dim = sf.dim() == 2
+    if squeeze_group_dim:
+        sf = sf.unsqueeze(0)
+    num_groups, mn, packed_sf_k = sf.shape
+    assert mn % 128 == 0
+    result = (sf.reshape(num_groups, -1, 32, 4, packed_sf_k)
+              .transpose(2, 3)
+              .reshape(num_groups, mn, packed_sf_k))
+    result = torch.empty_like(sf).copy_(result)
+    return result.squeeze(0) if squeeze_group_dim else result
 
-    Cached by default (the transformed weight SF tensors are fixed after
-    load); pass ``cached=False`` for scratch tensors whose contents change
-    per call.
+
+def _mega_moe_decode_fp4(packed: torch.Tensor) -> torch.Tensor:
+    """[..., K/2] int8 packed FP4 (lo nibble = even k) -> [..., K] fp32."""
+    u = packed.to(torch.uint8).to(torch.int64)
+    codes = torch.stack([u & 0xF, (u >> 4) & 0xF], dim=-1)
+    codes = codes.reshape(*packed.shape[:-1], packed.shape[-1] * 2)
+    return _E2M1_DECODE_F32.to(codes.device)[codes]
+
+
+def _mega_moe_unpack_ue8m0(sf_packed: torch.Tensor) -> torch.Tensor:
+    """[..., K/128] int32 UE8M0 words -> [..., K/32] fp32 powers of two."""
+    bytes_ = sf_packed.contiguous().view(torch.uint8)
+    return (bytes_.to(torch.int32) << 23).view(torch.float32).reshape(
+        *sf_packed.shape[:-1], sf_packed.shape[-1] * 4
+    )
+
+
+_mega_moe_fused_weight_cache: dict[
+    tuple[int, tuple], tuple[torch.Tensor, torch.Tensor]
+] = {}
+
+
+def _mega_moe_fused_weights(
+    l1_weights: tuple[torch.Tensor, torch.Tensor],
+    l2_weights: tuple[torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dequantize the packed FP4 MegaMoE weights and fold the UE8M0 scales
+    into FP8 for the SM120 fused kernel.
+
+    Every E2M1 value times a power of two fits E4M3's mantissa exactly, so
+    the fold is lossless (up to the |448| fp8 range clamp). The L1 result is
+    returned in the fused kernel's [gate | up] N layout. Cached by weight
+    data pointers (weights are fixed after load).
     """
-    if cached:
-        key = (sf_int32.data_ptr(), tuple(sf_int32.shape))
-        cached_ = _mega_moe_sf_fp32_cache.get(key)
-        if cached_ is not None:
-            return cached_
-    # the UTCCP transpose leaves a non-contiguous MN view; materialize
-    # first. Each int32 still packs 4 consecutive k-groups (the packed
-    # k dim is the transpose-invariant last dim).
-    bytes_ = sf_int32.contiguous().view(torch.uint8)
-    result = (bytes_.to(torch.int32) << 23).view(torch.float32)
-    result = result.contiguous()
-    if cached:
-        _mega_moe_sf_fp32_cache[key] = result
+    key = (
+        l1_weights[0].data_ptr(), tuple(l1_weights[0].shape),
+        l2_weights[0].data_ptr(), tuple(l2_weights[0].shape),
+    )
+    cached_ = _mega_moe_fused_weight_cache.get(key)
+    if cached_ is not None:
+        return cached_
+    w13_packed = _mega_moe_deinterleave_weights(l1_weights[0].contiguous())
+    # the L1 sf was transformed as utccp(interleave(raw)): invert utccp first
+    # (the interleave and utccp reshapes do not commute)
+    w13_sf = _mega_moe_deinterleave_weights(
+        _mega_moe_untranspose_sf_for_utccp(l1_weights[1].contiguous())
+    )
+    w13_32 = _mega_moe_decode_fp4(w13_packed)
+    w13_sf32 = _mega_moe_unpack_ue8m0(w13_sf)
+    w13_fp8 = (w13_32 * w13_sf32.repeat_interleave(32, dim=-1)).to(torch.float8_e4m3fn)
+    w2_packed = l2_weights[0].contiguous()
+    w2_sf = _mega_moe_untranspose_sf_for_utccp(l2_weights[1].contiguous())
+    w2_32 = _mega_moe_decode_fp4(w2_packed)
+    w2_sf32 = _mega_moe_unpack_ue8m0(w2_sf)
+    w2_fp8 = (w2_32 * w2_sf32.repeat_interleave(32, dim=-1)).to(torch.float8_e4m3fn)
+    result = (w13_fp8, w2_fp8)
+    _mega_moe_fused_weight_cache[key] = result
     return result
 
 
@@ -837,14 +884,16 @@ def _mega_moe_layout_and_gather(
     expert_local: torch.Tensor,  # [n] int64 local expert ids (unsorted)
     x_rows: torch.Tensor,        # [n, H] fp8
     x_sf_rows: torch.Tensor,     # [n, H/128] int32
+    row_ids: torch.Tensor,       # [n] int32 ids to permute alongside rows
     num_local_experts: int,
     scratch: dict,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sort rows by expert and build a padded grouped layout.
 
-    Returns (order, inv_order): `order` maps sorted positions to input rows,
-    `inv_order` maps input rows back to sorted positions. The scratch layout
-    and A tensors are filled in place.
+    Returns (starts, counts): the per-expert padded (aligned) cumulative row
+    offsets and the real token counts. The scratch layout/a/a_sf/home tensors
+    are filled in place: `home` carries each layout row's pair id (-1 for
+    padding), which is the d2 slot the fused kernel scatters into.
     """
     n = expert_local.shape[0]
     order = torch.argsort(expert_local, stable=True)
@@ -869,16 +918,14 @@ def _mega_moe_layout_and_gather(
         torch.zeros_like(r),
     )
     layout.copy_(torch.where(valid, group, -1).to(torch.int32))
-    scratch["a"].copy_(x_rows[order[src_sorted]])
-    scratch["a_sf"].copy_(x_sf_rows[order[src_sorted]])
-    inv_order = torch.empty_like(order)
-    inv_order[order] = torch.arange(n, device=expert_local.device)
-    # inv_order currently maps input rows to their position in the
-    # expert-sorted order. The grouped-gemm outputs (d1/d2) live at layout
-    # rows, whose per-expert starts are aligned to _MEGA_MOE_ALIGN, so shift
-    # each entry by the per-expert (layout - sorted) offset.
-    inv_order = inv_order + (starts - real_starts)[expert_local]
-    return order, inv_order
+    src_rows = order[src_sorted]
+    scratch["a"].copy_(x_rows[src_rows])
+    scratch["a_sf"].copy_(x_sf_rows[src_rows])
+    # the fused kernel scatters d2 by slot: layout row r writes d2[home[r]]
+    home = scratch["home"]
+    home.fill_(-1)
+    home[valid] = row_ids[src_rows[valid]]
+    return starts, counts
 
 
 def _mega_moe_local_compute(
@@ -892,47 +939,38 @@ def _mega_moe_local_compute(
     scratch: dict,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused L1 -> swiglu -> quantize -> L2 for a local batch of (row, expert)
-    pairs. Returns (partial, row_ids_out) in the input row order."""
+    pairs, via the native SM120 mega kernel. Returns (partial, row_ids_out)
+    in the input row order."""
     from vllm.utils import deep_gemm
 
-    n = x_rows.shape[0]
     H = x_rows.shape[1]
-    I = l1_weights[0].shape[1] // 2
     E = l1_weights[0].shape[0]
 
-    order, inv_order = _mega_moe_layout_and_gather(
-        expert_local, x_rows, x_sf_rows, E, scratch,
+    starts, counts = _mega_moe_layout_and_gather(
+        expert_local, x_rows, x_sf_rows, row_ids, E, scratch,
     )
-    layout = scratch["layout"]
-    d1 = scratch["d1"]
-    a_sf_f32 = _mega_moe_sf_int32_to_fp32(scratch["a_sf"], cached=False)
-    l1_sf_f32 = _mega_moe_sf_int32_to_fp32(l1_weights[1])
-    deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
-        (scratch["a"], a_sf_f32), (l1_weights[0], l1_sf_f32), d1, layout,
-        recipe=(1, 1, 32), disable_ue8m0_cast=False,
+    cap = scratch["layout"].shape[0]
+
+    # Fold the per-128 x scales into the fp8 bytes (the fused kernel takes
+    # pre-scaled operands; SM121 has no block-scaled MMA).
+    chunk = min(2048, triton.next_power_of_2(H))
+    _mega_fold_x_sf_kernel[(cap,)](
+        scratch["a"].view(torch.uint8), scratch["a_sf"],
+        scratch["a_folded"].view(torch.uint8),
+        H=H, CHUNK=chunk, num_warps=4,
     )
-    act = scratch["act"]
-    act_sf = scratch["act_sf"]
-    two_i = 2 * I
-    chunk = min(2048, triton.next_power_of_2(two_i))
-    assert two_i % chunk == 0
-    has_clamp = activation_clamp is not None
-    clamp = float(activation_clamp) if has_clamp else 0.0
-    cap = layout.shape[0]
-    _mega_swiglu_quant_kernel[(triton.cdiv(cap, _MEGA_MOE_BLOCK_ROWS),)](
-        d1, act, act_sf, cap,
-        TWO_I=two_i, CHUNK=chunk, HAS_CLAMP=has_clamp, CLAMP=clamp,
-        BLOCK_ROWS=_MEGA_MOE_BLOCK_ROWS,
+    w13_fp8, w2_fp8 = _mega_moe_fused_weights(l1_weights, l2_weights)
+    deep_gemm.sm120_fp8_fp4_mega_moe(
+        scratch["a_folded"], w13_fp8, w2_fp8,
+        starts.to(torch.int32), counts.to(torch.int32),
+        scratch["home"], scratch["d2"],
+        acts=scratch["acts"], acts_sf=scratch["acts_sf"],
+        activation_clamp=(
+            activation_clamp if activation_clamp is not None else float("inf")
+        ),
     )
-    d2 = scratch["d2"]
-    l2_sf_f32 = _mega_moe_sf_int32_to_fp32(l2_weights[1])
-    deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
-        (act, act_sf), (l2_weights[0], l2_sf_f32), d2, layout,
-        recipe=(1, 1, 32), disable_ue8m0_cast=False,
-    )
-    # d2 rows live at layout rows; inv_order maps input rows there. The ids
-    # are already in input order, so they need no permutation.
-    d2o = d2[inv_order]
+    # d2 is slot-indexed: the j-th input row's partial lives at d2[row_ids[j]]
+    d2o = scratch["d2"][row_ids]
     return d2o, row_ids
 
 
@@ -943,14 +981,24 @@ def _mega_moe_get_scratch(device, H: int, I: int, E: int, cap: int) -> dict:
     key = (device, H, I, E, cap)
     scratch = _mega_moe_scratch_cache.get(key)
     if scratch is None:
+        # the fused kernel's acts scratch has one slot per SM
+        num_sms = torch.cuda.get_device_properties(device).multi_processor_count
         scratch = {
             "layout": torch.full((cap,), -1, dtype=torch.int32, device=device),
             "a": torch.zeros((cap, H), dtype=torch.float8_e4m3fn, device=device),
-            "a_sf": torch.full((cap, H // 128), 0x7F7F7F7F, dtype=torch.int32, device=device),
-            "d1": torch.zeros((cap, 2 * I), dtype=torch.bfloat16, device=device),
-            "act": torch.zeros((cap, I), dtype=torch.float8_e4m3fn, device=device),
-            "act_sf": torch.zeros((cap, I // 32), dtype=torch.float32, device=device),
+            "a_sf": torch.full(
+                (cap, H // 128), 0x7F7F7F7F, dtype=torch.int32, device=device
+            ),
+            "a_folded": torch.zeros((cap, H), dtype=torch.float8_e4m3fn, device=device),
+            "home": torch.full((cap,), -1, dtype=torch.int32, device=device),
             "d2": torch.zeros((cap, H), dtype=torch.bfloat16, device=device),
+            "acts": torch.zeros(
+                (num_sms * 64 * I,), dtype=torch.float8_e4m3fn, device=device
+            ),
+            "acts_sf": torch.zeros(
+                (num_sms * 64 * (I // 128),), dtype=torch.int32, device=device
+            ),
+            "acc": torch.zeros((cap, H), dtype=torch.float32, device=device),
         }
         _mega_moe_scratch_cache[key] = scratch
     return scratch
@@ -1043,7 +1091,8 @@ def fp8_fp4_mega_moe(
         token = torch.arange(num_tokens, device=y.device).repeat_interleave(top_k)
         slot = torch.arange(top_k, device=y.device).repeat(num_tokens)
         w = topk_weights[token, slot]
-        acc = scratch["act_sf"].new_zeros((max_tokens, H)).to(torch.float32)
+        acc = scratch["acc"]
+        acc.zero_()
         acc.index_add_(0, token, partial.float() * w.unsqueeze(-1))
         y.copy_(acc[:num_tokens].to(y.dtype))
         return
@@ -1156,6 +1205,7 @@ def fp8_fp4_mega_moe(
         valid_contrib.unsqueeze(-1), bpartial,
         torch.zeros_like(bpartial),
     )
-    acc = scratch["act_sf"].new_zeros((max_tokens, H)).to(torch.float32)
+    acc = scratch["acc"]
+    acc.zero_()
     acc.index_add_(0, btoken, bpartial.float() * bw.unsqueeze(-1))
     y.copy_(acc[:num_tokens].to(y.dtype))

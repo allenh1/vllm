@@ -495,12 +495,16 @@ def m_grouped_fp8_gemm_nt_contiguous(*args, **kwargs):
     )
 
 
-def m_grouped_fp8_fp4_gemm_nt_contiguous(*args, **kwargs):
+def m_grouped_fp8_fp4_gemm_nt_contiguous(
+    *args, disable_ue8m0_cast: bool | None = None, **kwargs
+):
     _lazy_init()
     if _grouped_fp4_impl is None:
         return _missing(*args, **kwargs)
+    if disable_ue8m0_cast is None:
+        disable_ue8m0_cast = not is_deep_gemm_e8m0_used()
     return _grouped_fp4_impl(
-        *args, disable_ue8m0_cast=not is_deep_gemm_e8m0_used(), **kwargs
+        *args, disable_ue8m0_cast=disable_ue8m0_cast, **kwargs
     )
 
 
@@ -513,12 +517,16 @@ def fp8_m_grouped_gemm_nt_masked(*args, **kwargs):
     )
 
 
-def transform_sf_into_required_layout(*args, **kwargs):
+def transform_sf_into_required_layout(
+    *args, disable_ue8m0_cast: bool | None = None, **kwargs
+):
     _lazy_init()
     if _transform_sf_into_required_layout_impl is None:
         return _missing(*args, **kwargs)
+    if disable_ue8m0_cast is None:
+        disable_ue8m0_cast = not is_deep_gemm_e8m0_used()
     return _transform_sf_into_required_layout_impl(
-        *args, disable_ue8m0_cast=not is_deep_gemm_e8m0_used(), **kwargs
+        *args, disable_ue8m0_cast=disable_ue8m0_cast, **kwargs
     )
 
 
@@ -529,7 +537,27 @@ def transform_weights_for_mega_moe(*args, **kwargs):
     return _transform_weights_for_mega_moe_impl(*args, **kwargs)
 
 
+def get_mega_moe_symm_buffer_sizer():
+    """Return the underlying DeepGEMM buffer-size/slicer callable.
+
+    Used by the SM12x orchestrated MegaMoE fallback to allocate a
+    single-rank staging buffer (the cross-rank symmetric-memory transport
+    requires intra-node NVLink and cannot work on 1-GPU-per-node clusters).
+    """
+    dg = _import_deep_gemm()
+    if dg is None:
+        return None
+    return dg._C.get_symm_buffer_size_for_mega_moe
+
+
 def get_symm_buffer_for_mega_moe(*args, **kwargs):
+    if current_platform.is_device_capability_family(120):
+        from vllm.models.deepseek_v4.nvidia.ops import sm12x_deep_gemm_fallbacks
+
+        group, num_experts, num_max_tokens, num_topk, hidden, intermediate = args[:6]
+        return sm12x_deep_gemm_fallbacks.make_sm12x_mega_moe_buffer(
+            num_experts, num_max_tokens, num_topk, hidden, intermediate
+        )
     _lazy_init()
     if _get_symm_buffer_for_mega_moe_impl is None:
         return _missing(*args, **kwargs)
@@ -537,6 +565,10 @@ def get_symm_buffer_for_mega_moe(*args, **kwargs):
 
 
 def fp8_fp4_mega_moe(*args, **kwargs):
+    if current_platform.is_device_capability_family(120):
+        from vllm.models.deepseek_v4.nvidia.ops import sm12x_deep_gemm_fallbacks
+
+        return sm12x_deep_gemm_fallbacks.fp8_fp4_mega_moe(*args, **kwargs)
     _lazy_init()
     if _fp8_fp4_mega_moe_impl is None:
         return _missing(*args, **kwargs)

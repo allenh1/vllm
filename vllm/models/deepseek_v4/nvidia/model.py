@@ -1239,11 +1239,15 @@ def _use_mega_moe(vllm_config: VllmConfig) -> bool:
 def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:
     parallel_config = vllm_config.parallel_config
     use_mega_moe = _use_mega_moe(vllm_config)
+    # Sequence parallel is only exercised with the fused MegaMoE kernel,
+    # which handles the SP sharding internally. The standard fused-MoE path
+    # with SP breaks the final hc_head input shapes (the residual streams
+    # stay SP-sharded while hidden_states are gathered).
     return (
-        parallel_config.pipeline_parallel_size == 1
+        use_mega_moe
+        and parallel_config.pipeline_parallel_size == 1
         and parallel_config.enable_expert_parallel
         and parallel_config.tensor_parallel_size > 1
-        and (use_mega_moe or parallel_config.data_parallel_size > 1)
     )
 
 

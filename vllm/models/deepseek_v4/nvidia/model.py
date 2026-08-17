@@ -1239,15 +1239,11 @@ def _use_mega_moe(vllm_config: VllmConfig) -> bool:
 def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:
     parallel_config = vllm_config.parallel_config
     use_mega_moe = _use_mega_moe(vllm_config)
-    # Sequence parallel is only exercised with the fused MegaMoE kernel,
-    # which handles the SP sharding internally. The standard fused-MoE path
-    # with SP breaks the final hc_head input shapes (the residual streams
-    # stay SP-sharded while hidden_states are gathered).
     return (
-        use_mega_moe
-        and parallel_config.pipeline_parallel_size == 1
+        parallel_config.pipeline_parallel_size == 1
         and parallel_config.enable_expert_parallel
         and parallel_config.tensor_parallel_size > 1
+        and (use_mega_moe or parallel_config.data_parallel_size > 1)
     )
 
 
@@ -1719,15 +1715,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         if self.use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
-            if final_aux_mean_pending:
-                # The deferred fused path (DSpark, no MTP buffer) feeds the last
-                # layer's residual streams straight into the post+mean+hc_head
-                # kernel, so they must be gathered to the same row domain as
-                # hidden_states; otherwise the fused kernel asserts a shape mismatch
-                # on its x vs residual token counts under EP+TP+SP.
-                residual = sp_all_gather(residual)[:full_num_tokens]
-                post_mix = sp_all_gather(post_mix)[:full_num_tokens]
-                res_mix = sp_all_gather(res_mix)[:full_num_tokens]
+            # The residual streams must be gathered to the same row domain as
+            # hidden_states; otherwise the final post/hc_head kernels assert a
+            # shape mismatch on their x vs residual token counts under
+            # EP+TP+SP. (The deferred fused DSpark path feeds these streams
+            # straight into post+mean+hc_head; the standard fused-MoE path
+            # feeds them into post+head.)
+            residual = sp_all_gather(residual)[:full_num_tokens]
+            post_mix = sp_all_gather(post_mix)[:full_num_tokens]
+            res_mix = sp_all_gather(res_mix)[:full_num_tokens]
 
         if self._mtp_hidden_buffer is not None:
             assert final_post_materialized

@@ -412,8 +412,15 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
     def _check_runtime_supported(self) -> None:
         device = self.w13_weight.device
-        if torch.cuda.get_device_capability(device)[0] != 10:
-            raise NotImplementedError("DeepGEMM MegaMoE requires SM100 GPUs.")
+        major = torch.cuda.get_device_capability(device)[0]
+        # SM100 runs the fused tcgen05 MegaMoE kernel. SM120/SM121 (DGX Spark
+        # GB10, no tcgen05/tmem) runs the vLLM-side orchestrated fallback that
+        # composes the SM120 DeepGEMM grouped-gemm kernels; the weight
+        # transforms and buffer creation below work on both.
+        if major not in (10, 12):
+            raise NotImplementedError(
+                "DeepGEMM MegaMoE requires SM100 or SM120 GPUs."
+            )
         if self.hidden_size % 128 != 0 or self.intermediate_size % 128 != 0:
             raise ValueError(
                 "DeepGEMM MegaMoE requires hidden and intermediate sizes "
@@ -839,6 +846,7 @@ class DeepseekV4MoE(nn.Module):
                 True,
             )
         )
+        self.use_mega_moe = _use_mega_moe(vllm_config)
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
                 "DeepSeek V4 MegaMoE currently requires expert parallel. "
@@ -1124,7 +1132,7 @@ class DeepseekV4MoE(nn.Module):
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
     ) -> torch.Tensor:
         org_shape = hidden_states.shape
-        if self.experts.is_internal_router:
+        if getattr(self.experts, "is_internal_router", False):
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
                 router_logits=hidden_states,
@@ -1210,9 +1218,27 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     return DeepseekV4FlashMLAAttention
 
 
+
+def _use_mega_moe(vllm_config: VllmConfig) -> bool:
+    """Whether the fused DeepGEMM MegaMoE kernel should be used.
+
+    The fused kernel is tcgen05-only (SM100). SM120/SM121 devices (DGX Spark
+    GB10) have no tcgen05 or tensor memory, so requesting the mega backend
+    there falls back to the standard fused-MoE path instead.
+    """
+    if vllm_config.kernel_config.moe_backend != "deep_gemm_mega_moe":
+        return False
+    if current_platform.is_device_capability_family(120):
+        logger.warning_once(
+            "DeepGEMM MegaMoE requires SM100 (tcgen05); the current SM12x "
+            "device will use the standard fused-MoE path instead."
+        )
+        return False
+    return True
+
 def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:
     parallel_config = vllm_config.parallel_config
-    use_mega_moe = vllm_config.kernel_config.moe_backend in MEGA_MOE_BACKENDS
+    use_mega_moe = _use_mega_moe(vllm_config)
     return (
         parallel_config.pipeline_parallel_size == 1
         and parallel_config.enable_expert_parallel
@@ -1416,7 +1442,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.config = config
         self.quant_config = quant_config
         self.parallel_config = vllm_config.parallel_config
-        self.use_mega_moe = vllm_config.kernel_config.moe_backend in MEGA_MOE_BACKENDS
+        self.use_mega_moe = _use_mega_moe(vllm_config)
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(

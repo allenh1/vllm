@@ -338,6 +338,20 @@ class KernelConfig:
         """Set platform-specific defaults for the kernel config."""
         from vllm.platforms import current_platform
 
+        if (
+            self.moe_backend == "deep_gemm_mega_moe"
+            and current_platform.is_device_capability_family(120)
+        ):
+            # The fused MegaMoE kernel is tcgen05-only (SM100). SM120/SM121
+            # devices (DGX Spark GB10) have no tcgen05 or tensor memory, so
+            # downgrade to the platform-default fused-MoE path instead of
+            # failing in the MXFP4 MoE backend validation.
+            logger.warning_once(
+                "deep_gemm_mega_moe requires SM100 (tcgen05); using the "
+                "platform default MoE backend on this SM12x device instead."
+            )
+            self.moe_backend = "auto"
+
         if vllm_config.model_config is not None:
             validate_flashinfer_moe_ep_model(
                 self.moe_backend, vllm_config.model_config.architectures

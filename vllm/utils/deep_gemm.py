@@ -168,6 +168,7 @@ _get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor_impl: (
 _transform_weights_for_mega_moe_impl: Callable[..., Any] | None = None
 _get_symm_buffer_for_mega_moe_impl: Callable[..., Any] | None = None
 _fp8_fp4_mega_moe_impl: Callable[..., Any] | None = None
+_sm120_fp8_fp4_mega_moe_impl: Callable[..., Any] | None = None
 
 
 @functools.cache
@@ -239,6 +240,7 @@ def _lazy_init() -> None:
     global _get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor_impl
     global _transform_weights_for_mega_moe_impl
     global _get_symm_buffer_for_mega_moe_impl, _fp8_fp4_mega_moe_impl
+    global _sm120_fp8_fp4_mega_moe_impl
     # fast path
     if (
         _cublaslt_gemm_nt_impl is not None
@@ -259,6 +261,7 @@ def _lazy_init() -> None:
         or _transform_weights_for_mega_moe_impl is not None
         or _get_symm_buffer_for_mega_moe_impl is not None
         or _fp8_fp4_mega_moe_impl is not None
+        or _sm120_fp8_fp4_mega_moe_impl is not None
     ):
         return
 
@@ -319,6 +322,7 @@ def _lazy_init() -> None:
         _dg, "get_symm_buffer_for_mega_moe", None
     )
     _fp8_fp4_mega_moe_impl = getattr(_dg, "fp8_fp4_mega_moe", None)
+    _sm120_fp8_fp4_mega_moe_impl = getattr(_dg, "sm120_fp8_fp4_mega_moe", None)
     DeepGemmQuantScaleFMT.init_oracle_cache()
 
 
@@ -562,6 +566,14 @@ def get_symm_buffer_for_mega_moe(*args, **kwargs):
     if _get_symm_buffer_for_mega_moe_impl is None:
         return _missing(*args, **kwargs)
     return _get_symm_buffer_for_mega_moe_impl(*args, **kwargs)
+
+
+def sm120_fp8_fp4_mega_moe(*args, **kwargs):
+    """Fused local MegaMoE compute for SM120/SM121 (native GB10 kernel)."""
+    _lazy_init()
+    if _sm120_fp8_fp4_mega_moe_impl is None:
+        return _missing(*args, **kwargs)
+    return _sm120_fp8_fp4_mega_moe_impl(*args, **kwargs)
 
 
 def fp8_fp4_mega_moe(*args, **kwargs):

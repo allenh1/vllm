@@ -6636,22 +6636,41 @@ class GPUModelRunner(
                         )
 
                         # Create dummy batch of multimodal inputs.
-                        batched_dummy_mm_inputs = self._get_mm_dummy_batch(
-                            dummy_modality,
-                            max_mm_items_per_batch,
-                        )
+                        # Models with custom processors (no
+                        # preprocessor_config.json) raise ValueError here
+                        # — skip encoder profiling and use the budget.
+                        try:
+                            batched_dummy_mm_inputs = (
+                                self._get_mm_dummy_batch(
+                                    dummy_modality,
+                                    max_mm_items_per_batch,
+                                )
+                            )
 
-                        # Run multimodal encoder.
-                        dummy_encoder_outputs = self.model.embed_multimodal(
-                            **batched_dummy_mm_inputs
-                        )
+                            # Run multimodal encoder.
+                            dummy_encoder_outputs = (
+                                self.model.embed_multimodal(
+                                    **batched_dummy_mm_inputs
+                                )
+                            )
 
-                        sanity_check_mm_encoder_outputs(
-                            dummy_encoder_outputs,
-                            expected_num_items=max_mm_items_per_batch,
-                        )
-                        for i, output in enumerate(dummy_encoder_outputs):
-                            self.encoder_cache[f"tmp_{i}"] = output
+                            sanity_check_mm_encoder_outputs(
+                                dummy_encoder_outputs,
+                                expected_num_items=max_mm_items_per_batch,
+                            )
+                            for i, output in enumerate(
+                                dummy_encoder_outputs
+                            ):
+                                self.encoder_cache[f"tmp_{i}"] = output
+                        except ValueError as e:
+                            if "No HuggingFace processor" not in str(e):
+                                raise
+                            logger.warning(
+                                "Skipping encoder profiling: %s. "
+                                "Using budget of %s tokens.",
+                                e,
+                                encoder_budget,
+                            )
 
         # Add `is_profile` here to pre-allocate communication buffers
         hidden_states, last_hidden_states = self._dummy_run(

@@ -263,6 +263,16 @@ def get_processor(
             raise e
 
     if not isinstance(processor, processor_cls):
+        from transformers.tokenization_utils_tokenizers import TokenizersBackend
+
+        if isinstance(processor, TokenizersBackend):
+            raise ValueError(
+                f"No HuggingFace processor found for '{processor_name}'; "
+                "AutoProcessor fell back to a tokenizer. If this model uses "
+                "a custom multimodal processor, override "
+                "get_mm_max_tokens_per_item() to bypass dummy-input "
+                "processing."
+            )
         raise TypeError(
             "Invalid type of HuggingFace processor. "
             f"Expected type: {processor_cls}, but "

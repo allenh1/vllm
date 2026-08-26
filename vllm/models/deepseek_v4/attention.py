@@ -15,6 +15,10 @@ from transformers import DeepseekV2Config, DeepseekV3Config
 
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.model_executor.kernels.linear import (
+    TritonFp8BlockScaledMMKernel,
+    init_fp8_linear_kernel,
+)
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -273,6 +277,27 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         )
         self.wo_a.is_bmm = True
         self.wo_a.bmm_batch_size = self.n_local_groups
+
+        # wo_a is consumed RAW by deep_gemm_fp8_o_proj -> deepseek_v4_fp8_einsum,
+        # which expects the out-major fp8 weight as [out_pp, in_pp] (per-TP-shard
+        # [2048, 4096]) plus its [N, K] block scale. The block-kernel selection
+        # (post-rebase) routes this layer to a repacking kernel on SM120
+        # (Humming / DeepGemm / Cutlass), whose process_weights_after_loading
+        # mutates the weight into a K-major / packed / 3D layout the einsum cannot
+        # consume. Force the pad-only Triton block kernel so the weight stays
+        # out-major fp8 [out_pp, in_pp].
+        qm = getattr(self.wo_a, "quant_method", None)
+        if getattr(qm, "block_quant", False) and hasattr(qm, "fp8_linear"):
+            qm.fp8_linear = init_fp8_linear_kernel(
+                activation_quant_key=qm.activation_quant_key,
+                weight_quant_key=qm.weight_quant_key,
+                input_dtype=qm.input_dtype,
+                out_dtype=qm.out_dtype,
+                weight_shape=tuple(self.wo_a.weight.shape),
+                force_kernel=TritonFp8BlockScaledMMKernel,
+                module_name="deepseek_v4_wo_a",
+            )
+            qm.use_marlin = False
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,

@@ -86,6 +86,7 @@ def _get_backend_priorities(
     num_heads: int | None = None,
     kv_cache_dtype: CacheDType | None = None,
     use_non_causal: bool = False,
+    head_size: int | None = None,
 ) -> list[AttentionBackendEnum]:
     """Get backend priorities with lazy import to avoid circular dependency."""
     from vllm.utils.torch_utils import is_quantized_kv_cache
@@ -133,37 +134,15 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
             ]
         else:
-            # Prefer FlashInfer FA3 for GLM-5.3-Flash NoPE sparse MLA on SM90;
-            # its feature gate falls through to the other sparse backends when
-            # unsupported. RoPE sparse models retain their existing order.
-            from vllm.config import get_current_vllm_config_or_none
-
-            cfg = get_current_vllm_config_or_none()
-            hf = (
-                cfg.model_config.hf_text_config
-                if cfg is not None and cfg.model_config is not None
-                else None
-            )
-            prefer_fi_sm90 = (
-                hf is not None
-                and getattr(hf, "qk_rope_head_dim", None) == 0
-                and hasattr(hf, "index_topk")
-            )
             sparse_tail = [
                 AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE,
                 AttentionBackendEnum.FLASHMLA_SPARSE,
-                AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90,
             ]
-            if prefer_fi_sm90:
-                sparse_tail.pop()  # dedupe the head entry
-                return [
-                    AttentionBackendEnum.FLASH_ATTN_MLA,
-                    AttentionBackendEnum.FLASHMLA,
-                    AttentionBackendEnum.FLASHINFER_MLA,
-                    AttentionBackendEnum.TRITON_MLA,
-                    AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90,
-                    *sparse_tail,
-                ]
+            flashinfer_sparse = AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90
+            if head_size == 512:
+                sparse_tail.insert(0, flashinfer_sparse)
+            else:
+                sparse_tail.append(flashinfer_sparse)
             return [
                 AttentionBackendEnum.FLASH_ATTN_MLA,
                 AttentionBackendEnum.FLASHMLA,
@@ -403,11 +382,12 @@ class CudaPlatformBase(Platform):
         invalid_reasons: dict[AttentionBackendEnum, tuple[int, list[str]]] = {}
 
         backend_priorities = _get_backend_priorities(
-            attn_selector_config.use_mla,
-            device_capability,
-            num_heads,
-            attn_selector_config.kv_cache_dtype,
-            attn_selector_config.use_non_causal,
+            use_mla=attn_selector_config.use_mla,
+            device_capability=device_capability,
+            num_heads=num_heads,
+            kv_cache_dtype=attn_selector_config.kv_cache_dtype,
+            use_non_causal=attn_selector_config.use_non_causal,
+            head_size=attn_selector_config.head_size,
         )
         for priority, backend in enumerate(backend_priorities):
             try:
@@ -441,8 +421,14 @@ class CudaPlatformBase(Platform):
 
         # kpool paged-MQA indexer: the storage block (block_size /
         # index_kpool) is virtually split into pool pages, so block_size
-        # must be a multiple of index_kpool * min(PAGED_MQA_PAGE_SIZES).
-        return index_kpool * min(PAGED_MQA_PAGE_SIZES)
+        # must be a multiple of index_kpool times a legal pool page.
+        page = min(PAGED_MQA_PAGE_SIZES)
+        if cls.is_device_capability_family(120):
+            # On sm120 the DeepGEMM paged-MQA kernel only accepts block_kv
+            # 64 for the fp8 indexer cache, so align to the largest pool
+            # page here to make the page split land on 64 not the min 32.
+            page = max(PAGED_MQA_PAGE_SIZES)
+        return index_kpool * page
 
     @classmethod
     def get_attn_backend_cls(

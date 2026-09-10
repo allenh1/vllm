@@ -854,12 +854,10 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         # and num_splits via PyTorch's graph-aware allocator so CUDA graph
         # capture reuses the same addresses on replay); subsequent same-type
         # layers see have_initialized=True and skip the planner.
-        tile_metadata = getattr(
-            swa_metadata, f"tile_sched_{self.tile_sched_layer_type()}"
-        )
+        layer_type = self.tile_sched_layer_type()
+        tile_metadata = getattr(swa_metadata, f"tile_sched_{layer_type}")
         assert tile_metadata is not None, (
-            "swa_metadata missing tile_sched entry for "
-            f"compress_ratio={self.compress_ratio}; "
+            f"swa_metadata missing tile_sched entry for layer type {layer_type!r}; "
             "DeepseekSparseSWAMetadataBuilder.build_tile_scheduler did not "
             "allocate one for this layer type."
         )

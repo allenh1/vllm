@@ -712,9 +712,16 @@ class SpeculativeConfig:
                     ],
                 }
             )
-        if hf_config.model_type == "deepseek_v4":
+        if hf_config.model_type in ("deepseek_v4", "deepseek_v41"):
             hf_config.model_type = "deepseek_mtp"
             n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+            if n_predict is None:
+                # DeepSeek-V4.1 nests its text fields under `text_config`.
+                n_predict = getattr(
+                    getattr(hf_config, "text_config", None),
+                    "num_nextn_predict_layers",
+                    None,
+                )
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["DeepSeekV4MTPModel"]}
             )

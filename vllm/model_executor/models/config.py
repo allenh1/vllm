@@ -330,7 +330,7 @@ class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):
         quant_config = getattr(model_config.hf_config, "quantization_config", None)
         if quant_config is not None and quant_config.get("quant_method") == "fp8":
             model_type = getattr(model_config.hf_config, "model_type", None)
-            if model_type == "deepseek_v4":
+            if model_type in ("deepseek_v4", "deepseek_v41", "deepseek_v41_text"):
                 model_config.hf_config.quantization_config["quant_method"] = (
                     "deepseek_v4_fp8"
                 )
@@ -343,7 +343,7 @@ class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):
             and hf_text_quant_config.get("quant_method") == "fp8"
         ):
             model_type = getattr(model_config.hf_text_config, "model_type", None)
-            if model_type == "deepseek_v4":
+            if model_type in ("deepseek_v4", "deepseek_v41", "deepseek_v41_text"):
                 model_config.hf_text_config.quantization_config["quant_method"] = (
                     "deepseek_v4_fp8"
                 )

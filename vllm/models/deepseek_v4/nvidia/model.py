@@ -884,6 +884,17 @@ class DeepseekV4MoE(nn.Module):
 
         self.gate.e_score_correction_bias = None
         self.gate.tid2eid = None
+        # DeepSeek-V4.1 ships a second selection-correction bias used for image
+        # span tokens (`noaux_tc_for_vl`). Plain V4 has no such tensor; the
+        # config marker keeps this absent there so the parameter set is
+        # unchanged. NOTE: loaded but not yet consumed by routing -- see
+        # mods/add-dsv41-flash/README.md.
+        self.gate.bias_vl = None
+        if getattr(config, "gate_bias_vl", False):
+            self.gate.bias_vl = nn.Parameter(
+                torch.zeros(config.n_routed_experts, dtype=torch.float32),
+                requires_grad=False,
+            )
         is_hash_moe = extract_layer_index(prefix) < config.num_hash_layers
         self.hash_indices_dtype = torch.int64 if self.use_mega_moe else torch.int32
         if is_hash_moe:
@@ -1348,6 +1359,16 @@ class DeepseekV4DecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         attn_norm_weight = self.attn_norm.weight.data
         attn_norm_eps = self.attn_norm.variance_epsilon
+        # DeepSeek-V4.1 Engram: the n-gram memory is written into the
+        # hc-expanded residual stream at the start of the layer, between the
+        # post-mix that folds the previous layer's output in and the pre-mix
+        # that reads that stream. The fused post+pre kernel cannot host the
+        # write, so this layer runs them separately. `engram` is absent on
+        # plain V4, where this block is dead code.
+        engram = getattr(self, "engram", None)
+        if engram is not None and residual is not None:
+            x = engram(mhc_post_tilelang(x, residual, post_mix, res_mix))
+            residual = post_mix = res_mix = None
         if residual is None:
             # Run standalone mhc_pre on first layer
             if x.dim() == 2:

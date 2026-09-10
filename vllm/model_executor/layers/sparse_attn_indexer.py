@@ -3,6 +3,7 @@
 """Custom Sparse Attention Indexer layers."""
 
 import os
+from dataclasses import dataclass, field
 
 import torch
 
@@ -11,7 +12,7 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.distributed import get_dcp_group, get_pcp_group
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -382,6 +383,245 @@ def kv_cache_as_quant_view(
     return kv_cache.unsqueeze(-2)
 
 
+# ---------------------------------------------------------------------------
+# DeepSeek-V4.1's two-level candidate block selection
+# ---------------------------------------------------------------------------
+#
+# V4.1 restricts every index source after the candidate source (layer 20 in the
+# released model) to the blocks of compressed positions that source selected, so
+# most of the top-k work runs against a fraction of the positions. Level one is
+# the vendor's `select_candidate_blocks`, which already lives in the model
+# package (`vllm.models.deepseek_v4.attention`) -- it is imported late below
+# because that package imports this module.
+#
+# The one difference is the frame: the vendor scores one request per logits
+# tensor, so a query's blocks are groups of `block_size` columns starting at
+# column 0. Here a prefill chunk packs several requests into one tensor, and a
+# row owns the columns `[cu_seqlen_ks, cu_seqlen_ke)` -- its request's compressed
+# positions in the gathered key buffer -- so its blocks start at its own `ks`.
+# A row cannot reach another row's columns, so those stay masked out.
+
+
+def _v41_decode_candidate_mask(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    topk_blocks: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Level one for decode, where the frame is the index cache itself.
+
+    Every row's blocks start at column 0 -- there is no packing to anchor them
+    against, so this is the vendor's call unchanged -- and a row can see the
+    first `seq_lens` columns, which are already in compressed positions
+    (`DeepseekV32IndexerMetadataBuilder` divides by the compress ratio).
+
+    Returns a bool mask shaped like `logits` (one row per decode token, padded
+    tokens included; a padded row has `seq_lens == 0` and comes back all False).
+    """
+    # Deferred: `vllm.models.deepseek_v4.attention` imports this module.
+    from vllm.models.deepseek_v4.attention import select_candidate_blocks
+
+    rows, width = logits.shape
+    reach = seq_lens.reshape(-1).clamp(min=0)
+    assert reach.numel() == rows, (
+        f"V4.1 candidate selection needs one context length per logits row; got "
+        f"{reach.numel()} for {rows} rows."
+    )
+    # The paged logits kernel is asked not to clean what a row cannot reach, so
+    # those columns hold whatever was in the (uninitialized) output, and they
+    # have to leave the block scores before the max. The vendor's decode tensor
+    # is already truncated to the reach, which is the same thing.
+    scores = logits.masked_fill(
+        torch.arange(width, device=logits.device) >= reach.unsqueeze(-1),
+        float("-inf"),
+    )
+    return select_candidate_blocks(scores, reach, topk_blocks, block_size)
+
+
+def _v41_prefill_candidate_mask(
+    logits: torch.Tensor,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+    topk_blocks: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Level one for one packed prefill chunk.
+
+    `ks`/`ke` are the chunk's per-row key-buffer bounds
+    (`DeepseekV32IndexerPrefillChunkMetadata.cu_seqlen_ks/ke`): a row can see the
+    columns `[ks, ke)`, and `ks` is its request's first compressed position in
+    the gathered key buffer -- so a row's blocks are groups of `block_size`
+    columns *starting at its `ks`*, which is the vendor's grid, anchored by the
+    packing rather than by the tensor.
+
+    Returns a bool mask over the columns of `logits` (see the width note below).
+    """
+    # Deferred: `vllm.models.deepseek_v4.attention` imports this module.
+    from vllm.models.deepseek_v4.attention import select_candidate_blocks
+
+    rows, width = logits.shape
+    device = logits.device
+    # The metadata builds these in int32 (`BuildPrefillChunkMetadataKernel`) and
+    # they index `logits` here, which torch takes in int64 and nothing else.
+    ks = ks.to(torch.int64)
+    ke = ke.to(torch.int64)
+    reach = (ke - ks).clamp(min=0)
+    assert reach.numel() == rows and ks.numel() == rows, (
+        f"V4.1 candidate selection needs one key range per logits row; got "
+        f"{ks.numel()}/{reach.numel()} for {rows} rows."
+    )
+    # One block grid for the whole chunk's tensor: a row reads its own columns
+    # through a gather, and a gather has one width for every row. Sizing it needs
+    # two host reads -- the widest reach and the last row's column base -- and
+    # the metadata does not carry a host-side bound for either (`cu_seqlen_ke` is
+    # device-built in `BuildPrefillChunkMetadataKernel`).
+    max_reach = int(reach.max().item()) if rows else 0
+    block_pad = -(-max(max_reach, 1) // block_size) * block_size
+    out_width = (int(ks.max().item()) if rows else 0) + block_pad
+    cols = ks.unsqueeze(-1) + torch.arange(
+        block_pad, device=device, dtype=ks.dtype
+    )
+    # Reads past the frame land in the padding the block grid runs into, which no
+    # row can reach (a row's reach ends at or before the frame's last column), so
+    # what they hold cannot score: the reach mask below takes them out.
+    scores = logits.gather(1, cols.clamp(max=width - 1))
+    scores = scores.masked_fill(
+        torch.arange(block_pad, device=device) >= reach.unsqueeze(-1),
+        float("-inf"),
+    )
+    local = select_candidate_blocks(scores, reach, topk_blocks, block_size)
+    # Written back where each row's grid put the blocks. The mask is `out_width`
+    # wide rather than `width`: a row's last block is padded out to `block_size`
+    # and can run up to `block_size - 1` columns past the frame, exactly as the
+    # vendor's `F.pad` tail does before its `[..., :width]` truncation -- a reader
+    # trims it back to its own logits' width.
+    mask = torch.zeros((rows, out_width), dtype=torch.bool, device=device)
+    mask.scatter_(1, cols, local)
+    return mask
+
+
+def _v41_candidate_holder(candidate_source_prefix: str) -> "V41CandidateBlocks":
+    """The candidate blocks published under a layer prefix.
+
+    Level one runs on the logits this op materializes, so its result has to
+    leave the op and reach the *later* layers that consume it -- and an op is
+    handed a layer's name, not the module. `ForwardContext.no_compile_layers` is
+    the same `static_forward_context` mapping the model shares its caches
+    through, so both ends agree on where the blocks live without this op having
+    to learn the model's module tree.
+    """
+    holder = get_forward_context().no_compile_layers.get(candidate_source_prefix)
+    blocks = getattr(holder, "v41_candidate_blocks", None) if holder is not None else None
+    if blocks is None:
+        raise ValueError(
+            f"DeepSeek-V4.1: {candidate_source_prefix or '<unnamed>'} is not a "
+            "candidate source: it publishes no candidate blocks, so the index "
+            "sources after it cannot restrict their top-k to them."
+        )
+    return blocks
+
+
+@dataclass
+class V41CandidateBlocks:
+    """The candidate blocks one V4.1 forward pass publishes, and its stamp.
+
+    Produced and consumed by the indexer op -- the source layer (the config's
+    `candidate_source_layer_id`) picks the blocks, the index sources after it
+    mask their scores with them -- and held on the source layer's attention
+    module, which is where the op can find it by prefix.
+
+    The masks are bool and shaped like the logits that produced them: one per
+    prefill chunk, in chunk order, and one for decode. `forward_context` is the
+    forward pass they belong to, held rather than referred to by id: a source
+    that does not run its indexer for a batch (the dense-MHA short-extend case,
+    which deliberately leaves the top-k buffers alone) leaves it on the previous
+    pass, and a reader that needs blocks then fails loudly rather than masking
+    its scores with another batch's. Holding the object is what makes that
+    reliable -- an id is the object's address, and the previous pass's context
+    is usually dead by the time the reader asks, so the new one can be handed
+    the same address and compare equal.
+    """
+
+    prefill: list[torch.Tensor] = field(default_factory=list)
+    #: The `(token_start, token_end)` each mask above was built for, in the same
+    #: order. Two layers can only share a chunk's blocks by having split the
+    #: batch identically, and the token bounds are how a reader checks that
+    #: without comparing the masks themselves.
+    prefill_bounds: list[tuple[int, int]] = field(default_factory=list)
+    decode: torch.Tensor | None = None
+    forward_context: ForwardContext | None = None
+
+    def reset(self) -> None:
+        """Start a forward pass: drop the last one's masks and hold this one."""
+        self.prefill.clear()
+        self.prefill_bounds.clear()
+        self.decode = None
+        self.forward_context = get_forward_context()
+
+    def publish_prefill(
+        self, token_start: int, token_end: int, mask: torch.Tensor
+    ) -> None:
+        self.prefill.append(mask)
+        self.prefill_bounds.append((token_start, token_end))
+
+    def publish_decode(self, mask: torch.Tensor) -> None:
+        self.decode = mask
+
+    def _current_pass(self) -> None:
+        if self.forward_context is not get_forward_context():
+            raise RuntimeError(
+                "DeepSeek-V4.1: candidate blocks are stale. The layer that "
+                "selects them did not run its indexer for this batch (dense MHA "
+                "short extends skip it), so the blocks this layer would mask "
+                "with are from an earlier forward pass."
+            )
+
+    def take_prefill(
+        self,
+        index: int,
+        token_start: int,
+        token_end: int,
+        shape: torch.Size,
+    ) -> torch.Tensor:
+        self._current_pass()
+        if index >= len(self.prefill):
+            raise RuntimeError(
+                f"DeepSeek-V4.1: the candidate source published {len(self.prefill)} "
+                f"prefill chunks, so there is no mask for chunk {index}."
+            )
+        if self.prefill_bounds[index] != (token_start, token_end):
+            raise RuntimeError(
+                "DeepSeek-V4.1: the candidate source chunked this batch "
+                f"differently -- chunk {index} is tokens {token_start}:{token_end} "
+                f"here and {self.prefill_bounds[index]} for the source, so its "
+                "blocks are not this layer's to use."
+            )
+        mask = self.prefill[index]
+        if mask.shape[0] != shape[0] or mask.shape[-1] < shape[-1]:
+            raise RuntimeError(
+                "DeepSeek-V4.1: candidate blocks are shaped "
+                f"{tuple(mask.shape)}, which does not cover logits shaped "
+                f"{tuple(shape)}."
+            )
+        return mask[:, : shape[-1]]
+
+    def take_decode(self, shape: torch.Size) -> torch.Tensor:
+        self._current_pass()
+        mask = self.decode
+        if mask is None:
+            raise RuntimeError(
+                "DeepSeek-V4.1: the candidate source ran no decode step, so "
+                "there are no blocks for this layer's decode logits to use."
+            )
+        if mask.shape[0] != shape[0] or mask.shape[-1] < shape[-1]:
+            raise RuntimeError(
+                "DeepSeek-V4.1: candidate blocks are shaped "
+                f"{tuple(mask.shape)}, which does not cover logits shaped "
+                f"{tuple(shape)}."
+            )
+        return mask[:, : shape[-1]]
+
+
 @eager_break_during_capture
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
@@ -406,6 +646,16 @@ def sparse_attn_indexer(
     dcp_world_size: int = 1,
     cp_kv_cache_interleave_size: int = 1,
     skip_topk_buffer_clear: bool = False,
+    # A plain `str`, unlike the layer names above: torch cannot write a default
+    # for the opaque `LayerName` into a schema (the parser has no `LayerName`
+    # literal) and this one has to default to "off". The only thing given up is
+    # that a compiled graph sees the prefix as a constant rather than a hoisted
+    # input -- and V4.1's recipe runs eager (`--enforce-eager`), so there is no
+    # graph for it to be a constant in.
+    candidate_source_prefix: str = "",
+    is_candidate_source: bool = False,
+    candidate_topk_blocks: int = 0,
+    candidate_block_size: int = 0,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     forward_context = get_forward_context()
@@ -458,6 +708,27 @@ def sparse_attn_indexer(
     has_decode = attn_metadata_narrowed.num_decodes > 0
     has_prefill = attn_metadata_narrowed.num_prefills > 0
     num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
+
+    # V4.1's two-level candidate selection. Level one runs on the logits this op
+    # materializes, so it is this op that publishes the blocks (the source layer)
+    # and this op that masks the scores with them (every index source after it).
+    # Both of the logits-free fast paths below have to stand down while it is
+    # active: neither ever holds the scores the blocks are chosen from or applied
+    # to.
+    use_candidates = bool(candidate_source_prefix) and candidate_topk_blocks > 0
+    candidate_blocks: V41CandidateBlocks | None = None
+    if use_candidates:
+        if dcp_world_size > 1:
+            # A DCP rank owns a strided shard of the compressed positions, and
+            # both the block a position belongs to and the block scores are
+            # defined over all of them.
+            raise NotImplementedError(
+                "DeepSeek-V4.1 candidate block selection does not support "
+                "decode context parallelism."
+            )
+        candidate_blocks = _v41_candidate_holder(candidate_source_prefix)
+        if is_candidate_source:
+            candidate_blocks.reset()
 
     # q_scale is required iff the FP4 cache path is enabled; the FP8 path
     # folds the Q scale into `weights` inside fused_indexer_q_rope_quant.
@@ -536,7 +807,11 @@ def sparse_attn_indexer(
             values_spec,
             scales_spec,
         )
-        for chunk in prefill_metadata.chunks:
+        # The chunk index is what pairs a consumer with the source's mask below:
+        # both walk their own metadata's chunks, which are the same chunks
+        # whenever the layers agree on the batch's geometry -- and the bounds
+        # check in `take_prefill` is what makes a disagreement loud.
+        for chunk_index, chunk in enumerate(prefill_metadata.chunks):
             cu_seqlen_ks = chunk.cu_seqlen_ks
             cu_seqlen_ke = chunk.cu_seqlen_ke
             assert chunk.local_cu_seq_lens is not None
@@ -564,6 +839,14 @@ def sparse_attn_indexer(
             if chunk.local_total_seq_lens == 0:
                 logits = q_slice.new_empty((q_slice.shape[0], 0), dtype=torch.float32)
                 topk_indices.fill_(-1)
+                if candidate_blocks is not None and is_candidate_source:
+                    # A chunk with nothing to score still holds its place in the
+                    # sequence of chunks both ends index by.
+                    candidate_blocks.publish_prefill(
+                        chunk.token_start,
+                        chunk.token_end,
+                        logits.new_zeros((logits.shape[0], 0), dtype=torch.bool),
+                    )
             else:
                 # DeepGEMM scalar-type tags (zero-copy): MXFP4 values → int8
                 # (kPackedFP4), scales → int32 squeezed to 1-D kv_sf / 2-D q_sf.
@@ -576,7 +859,8 @@ def sparse_attn_indexer(
                     k_quant_cast = k_quant
                     k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
                 if (
-                    not current_platform.is_xpu()
+                    candidate_blocks is None
+                    and not current_platform.is_xpu()
                     and fp8_fp4_mqa_topk_indices(
                         (q_slice_cast, q_scale_slice),
                         (k_quant_cast, k_scale_cast),
@@ -608,6 +892,31 @@ def sparse_attn_indexer(
                         clean_logits=False,
                     )
                 num_rows = logits.shape[0]
+                if candidate_blocks is not None:
+                    if is_candidate_source:
+                        candidate_blocks.publish_prefill(
+                            chunk.token_start,
+                            chunk.token_end,
+                            _v41_prefill_candidate_mask(
+                                logits,
+                                cu_seqlen_ks,
+                                cu_seqlen_ke,
+                                candidate_topk_blocks,
+                                candidate_block_size,
+                            ),
+                        )
+                    else:
+                        # Level two: this layer's own scores, but only inside the
+                        # candidate source's blocks.
+                        logits.masked_fill_(
+                            ~candidate_blocks.take_prefill(
+                                chunk_index,
+                                chunk.token_start,
+                                chunk.token_end,
+                                logits.shape,
+                            ),
+                            float("-inf"),
+                        )
                 ops.top_k_per_row_prefill(
                     logits,
                     cu_seqlen_ks,
@@ -704,7 +1013,8 @@ def sparse_attn_indexer(
         logits_bytes = num_padded_tokens * logits_width * torch.float32.itemsize
         used_direct_topk = False
         if (
-            not current_platform.is_xpu()
+            candidate_blocks is None
+            and not current_platform.is_xpu()
             and decode_metadata.global_seq_lens is None
             and logits_bytes > sparse_indexer_max_logits_bytes()
         ):
@@ -753,6 +1063,18 @@ def sparse_attn_indexer(
                     indices=decode_metadata.indices,
                 )
             num_rows = logits.shape[0]
+
+            if candidate_blocks is not None:
+                if is_candidate_source:
+                    candidate_blocks.publish_decode(
+                        _v41_decode_candidate_mask(
+                            logits, seq_lens, candidate_topk_blocks, candidate_block_size
+                        )
+                    )
+                else:
+                    logits.masked_fill_(
+                        ~candidate_blocks.take_decode(logits.shape), float("-inf")
+                    )
 
             use_cooperative_topk = (
                 current_platform.is_cuda()
@@ -863,6 +1185,16 @@ def sparse_attn_indexer_fake(
     dcp_world_size: int = 1,
     cp_kv_cache_interleave_size: int = 1,
     skip_topk_buffer_clear: bool = False,
+    # A plain `str`, unlike the layer names above: torch cannot write a default
+    # for the opaque `LayerName` into a schema (the parser has no `LayerName`
+    # literal) and this one has to default to "off". The only thing given up is
+    # that a compiled graph sees the prefix as a constant rather than a hoisted
+    # input -- and V4.1's recipe runs eager (`--enforce-eager`), so there is no
+    # graph for it to be a constant in.
+    candidate_source_prefix: str = "",
+    is_candidate_source: bool = False,
+    candidate_topk_blocks: int = 0,
+    candidate_block_size: int = 0,
 ) -> torch.Tensor:
     return topk_indices_buffer
 
@@ -902,6 +1234,10 @@ class SparseAttnIndexer(CustomOp):
         skip_k_cache_insert: bool = False,
         use_fp4_cache: bool = False,
         compress_ratio: int = 1,
+        is_candidate_source: bool = False,
+        candidate_source_prefix: str = "",
+        candidate_topk_blocks: int = 0,
+        candidate_block_size: int = 0,
     ):
         super().__init__()
         self.k_cache = k_cache
@@ -915,6 +1251,20 @@ class SparseAttnIndexer(CustomOp):
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
         self.compress_ratio = compress_ratio
+        # V4.1's two-level top-k. `candidate_source_prefix` is the *attention*
+        # module of the layer that picks the candidate blocks -- this layer's own
+        # when it is the source, the layer it reads its index keys from
+        # otherwise -- and both ends have to agree on the block geometry for a
+        # block index to mean the same thing on either side.
+        self.is_candidate_source = is_candidate_source
+        self.candidate_source_prefix = candidate_source_prefix
+        self.candidate_topk_blocks = candidate_topk_blocks
+        self.candidate_block_size = candidate_block_size
+        if candidate_source_prefix:
+            assert candidate_topk_blocks > 0 and candidate_block_size > 0, (
+                "V4.1 candidate block selection needs `candidate_topk_blocks` "
+                "and `candidate_block_size` from the config."
+            )
         self.dense_mha_metadata_layer_name = ""
         # DCP scalars are constant for the run; resolve them here (config is set
         # during model construction) and pass them into the custom op, rather
@@ -982,6 +1332,10 @@ class SparseAttnIndexer(CustomOp):
             self.dcp_rank,
             self.dcp_world_size,
             self.cp_kv_cache_interleave_size,
+            candidate_source_prefix=self.candidate_source_prefix,
+            is_candidate_source=self.is_candidate_source,
+            candidate_topk_blocks=self.candidate_topk_blocks,
+            candidate_block_size=self.candidate_block_size,
         )
 
     def forward_xpu(
@@ -1004,6 +1358,11 @@ class SparseAttnIndexer(CustomOp):
         assert isinstance(q_quant, torch.Tensor), (
             "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"
         )
+        if self.candidate_source_prefix:
+            raise NotImplementedError(
+                "DeepSeek-V4.1 candidate block selection is not implemented for "
+                "the ROCm sparse indexer."
+            )
         from vllm.platforms.rocm import on_gfx11
 
         if (

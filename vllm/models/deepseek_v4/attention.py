@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from transformers import DeepseekV2Config, DeepseekV3Config
 
 import vllm.envs as envs
+from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.model_executor.kernels.linear import (
     TritonFp8BlockScaledMMKernel,
@@ -26,7 +27,10 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
+from vllm.model_executor.layers.sparse_attn_indexer import (
+    SparseAttnIndexer,
+    V41CandidateBlocks,
+)
 from vllm.models.common.ops import fused_q_kv_rmsnorm
 from vllm.models.deepseek_v4.common.ops import (
     fused_indexer_q_rope_quant,
@@ -43,7 +47,7 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_pcp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -64,6 +68,7 @@ from vllm.v1.attention.backends.mla.indexer import (
     get_max_prefill_buffer_size,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
+from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
@@ -171,6 +176,15 @@ def resolve_layer_compress_ratio(config, layer_id: int) -> tuple[int, bool]:
 # that are not also KV sources (24, 28, 32, 36) carry no `wk`/`k_norm` in the
 # checkpoint precisely because they score against the shared index keys.
 #
+# The indexer shares the same way, one level down. `index_source_layer_ids`
+# names the eight layers that run an indexer; only the four that are also KV
+# sources carry `wk`/`k_norm` and own an index-key cache, and the other four
+# score against the keys the *most recent* owner published. `candidate_source_layer_id`
+# (= 20) is the two-level selection: it is both a KV source and the ratio-1 index
+# owner, so it is the one layer whose index keys every later source reads, and it
+# is the layer that picks the candidate blocks every later source restricts its
+# own top-k to.
+#
 # A V4 checkpoint has none of these config keys, so `is_deepseek_v41` is False
 # for it and none of this code is reached.
 
@@ -185,6 +199,11 @@ class V41LayerRoles:
         "owns_compressed_kv",
         "runs_indexer",
         "kv_owner_layer",
+        "owns_index_keys",
+        "index_owner_layer",
+        "candidate_source_layer",
+        "is_candidate_source",
+        "uses_candidate_blocks",
         "use_unscaled_rope",
     )
 
@@ -196,6 +215,11 @@ class V41LayerRoles:
         runs_indexer: bool,
         kv_owner_layer: int | None,
         use_unscaled_rope: bool,
+        owns_index_keys: bool = False,
+        index_owner_layer: int | None = None,
+        candidate_source_layer: int | None = None,
+        is_candidate_source: bool = False,
+        uses_candidate_blocks: bool = False,
     ):
         self.raw_compress_ratio = raw_compress_ratio
         # Never 0, even for a raw 0 layer: the KV-cache specs divide by it and
@@ -207,6 +231,22 @@ class V41LayerRoles:
         #: The KV-source layer whose compressed cache and index keys this layer
         #: reads, or None when it owns them.
         self.kv_owner_layer = kv_owner_layer
+        #: This layer carries `wk`/`k_norm` and writes an index-key cache. True
+        #: only for an index source that is also a KV source, which is what the
+        #: checkpoint's tensor list shows: `indexer.wk`/`k_norm` exist on
+        #: 2/8/14/20 and on none of 24/28/32/36.
+        self.owns_index_keys = owns_index_keys
+        #: The index source whose index-key cache this layer scores against, or
+        #: None when it owns it. Only an index source has one: a layer that does
+        #: not run an indexer reuses the top-k its source published and never
+        #: looks at the keys.
+        self.index_owner_layer = index_owner_layer
+        #: Level one of the two-level top-k: this layer runs
+        #: `select_candidate_blocks` on its own scores and publishes the result.
+        self.is_candidate_source = is_candidate_source
+        #: Level two: this layer masks its own scores with the candidate blocks
+        #: its source published before taking its top-k.
+        self.uses_candidate_blocks = uses_candidate_blocks
         self.use_unscaled_rope = use_unscaled_rope
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
@@ -214,7 +254,11 @@ class V41LayerRoles:
             f"V41LayerRoles(raw={self.raw_compress_ratio}, "
             f"compression={self.compression_enabled}, "
             f"owns_kv={self.owns_compressed_kv}, indexer={self.runs_indexer}, "
-            f"kv_owner={self.kv_owner_layer})"
+            f"kv_owner={self.kv_owner_layer}, "
+            f"owns_index={self.owns_index_keys}, "
+            f"index_owner={self.index_owner_layer}, "
+            f"candidate_source={self.candidate_source_layer}, "
+            f"candidates={self.is_candidate_source}/{self.uses_candidate_blocks})"
         )
 
 
@@ -267,15 +311,240 @@ def v41_layer_roles(config, layer_id: int) -> V41LayerRoles | None:
     # compressed cache group it has no spec for.
     owner = max((s for s in kv_sources if s <= layer_id), default=None)
 
+    # Index keys are derived from the compressor's latent, so -- exactly like
+    # the compressed cache -- only a KV source can produce them. The index
+    # sources that are not KV sources (24/28/32/36) carry no `wk`/`k_norm` in
+    # the checkpoint for that reason and score against the newest owner's keys.
+    runs_indexer = raw > 0 and layer_id in index_sources
+    owns_index_keys = runs_indexer and layer_id in kv_sources
+    index_owner = max((s for s in index_sources if s <= layer_id and s in kv_sources), default=None)
+
+    candidate_source = getattr(config, "candidate_source_layer_id", None)
+    candidate_enabled = candidate_source is not None and candidate_source >= 0
+
     return V41LayerRoles(
         raw_compress_ratio=raw,
         compress_ratio=max(1, raw),
         owns_compressed_kv=owns_compressed_kv,
-        runs_indexer=raw > 0 and layer_id in index_sources,
+        runs_indexer=runs_indexer,
         kv_owner_layer=None if (owns_compressed_kv or raw == 0) else owner,
         # A raw 0 layer is trained on plain rope; so is the draft layer.
         use_unscaled_rope=raw == 0,
+        owns_index_keys=owns_index_keys,
+        index_owner_layer=(
+            None if (owns_index_keys or not runs_indexer) else index_owner
+        ),
+        # Named rather than left to the caller to read off the config: the
+        # layers that consume the candidate set need the source's *module* to
+        # find the blocks it published, and that is a prefix rewrite from here.
+        candidate_source_layer=candidate_source if candidate_enabled else None,
+        # The vendor's rule is `layer_id == candidate_source_layer` / `0 <=
+        # candidate_source_layer < layer_id`, narrowed here to the layers that
+        # run an indexer. Only those have scores of their own to select from or
+        # to mask: a layer without one reuses the top-k its source published and
+        # never sees the candidate set, and V4.1's three draft layers are raw 0.
+        is_candidate_source=(
+            runs_indexer and candidate_enabled and layer_id == candidate_source
+        ),
+        # The source itself is not a consumer -- it scores against every
+        # reachable position, which is what makes its own top-k the one it
+        # would have taken with no candidate step at all.
+        uses_candidate_blocks=(
+            runs_indexer and candidate_enabled and layer_id > candidate_source
+        ),
     )
+
+
+def select_candidate_blocks(
+    logits: torch.Tensor,
+    compress_lens: torch.Tensor | int,
+    topk_blocks: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Level one of V4.1's two-level top-k: the blocks a query may attend to.
+
+    A port of the vendor's `select_candidate_blocks`, semantics unchanged.
+    `logits` is `[..., n_positions]` with the positions a query cannot reach
+    already at -inf, which is what makes a block score of -inf mean "not
+    reachable yet" rather than "scored badly"; `compress_lens` is how many of
+    those positions this query can reach -- a plain int during decode, or a
+    tensor broadcasting against `logits`' leading dims when every row is a
+    different query (prefill, and speculative decode, where each draft position
+    has its own context length).
+
+    Two details carry the design and are easy to lose in a rewrite:
+
+    * ``-width % block_size`` pads the *logits* out to a whole number of blocks
+      with -inf, so a trailing partial block scores as the amax of its real
+      entries only; a shorter width must not be scored as if the missing
+      entries were 0.
+    * The query's newest block is pinned to +inf before the block top-k. It is
+      the one block that is only partly filled -- it holds the most recent
+      tokens, which the sliding window has not yet covered, and without the pin
+      a full older block outscoring it on amax would drop them. It is pinned
+      unconditionally, including when the query can reach nothing at all
+      (`compress_lens == 0`), where `last` is negative and pins nothing.
+
+    The result is a bool mask shaped like `logits`, so the layers that consume
+    it mask their scores and never think about blocks again. Blocks that came
+    back -inf -- unreachable leftovers when fewer than `topk_blocks` blocks are
+    reachable -- are dropped rather than kept, which is why the mask is built
+    from `values > -inf` and not from the indices alone.
+
+    The mask is per *block*, not per position: a selected block's positions come
+    back set even where the query cannot reach them, which only ever happens
+    inside the newest block. That is the vendor's behaviour and it is safe for
+    the same reason there -- the caller owes this function logits that are -inf
+    past the reach, so an unreachable position inside a selected block can never
+    win the top-k that follows.
+
+    `compress_lens` is an int, a 0-dim tensor for a whole-call value, or a
+    tensor shaped like `logits`' leading dims (one entry per row). The vendor's
+    prefill hands it a trailing 1 already on it; this wants the shape without
+    that dim, because the trailing axis here is the block axis it broadcasts
+    against.
+    """
+    width = logits.size(-1)
+    scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
+    scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
+    num_blocks = scores.size(-1)
+
+    last = (compress_lens - 1) // block_size
+    if isinstance(last, torch.Tensor):
+        # One entry per row, so it has to meet `scores`' trailing block axis
+        # with a singleton there. Without it, `arange(num_blocks) == last` is
+        # read as a same-rank comparison and raises whenever the batch size
+        # happens to differ from the block count.
+        last = last.unsqueeze(-1)
+    scores = scores.masked_fill(
+        torch.arange(num_blocks, device=logits.device) == last, torch.inf
+    )
+
+    top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
+    keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
+        -1, top.indices, top.values > -torch.inf
+    )
+    return keep.repeat_interleave(block_size, dim=-1)[..., :width]
+
+
+# ---------------------------------------------------------------------------
+# V4.1 index keys
+# ---------------------------------------------------------------------------
+#
+# V4.1 deleted the indexer's own compressor. In V4 the indexer carried a full
+# `DeepseekCompressor` of its own (its own `wkv`/`wgate` projection over the
+# hidden state, its own state cache, its own pool+norm) and stored its keys
+# through it. V4.1's checkpoint has no such tensors: the index sources that own
+# keys (2/8/14/20) carry `indexer.wk` (512 -> 128) and `indexer.k_norm` (RMSNorm
+# over 128) instead, and the vendor applies them to the *attention* compressor's
+# RoPE-free latent:
+#
+#     k = k_norm(wk(latent))            # latent = the compressor's norm(pooled)
+#     rope(k[..., -64:], at group position)
+#     quantize and write to the index key cache
+#
+# The latent is how the vendor's `Compressor.forward` *returns*; there it is one
+# row per compressed position (None while the current group is still filling
+# up). The fork's compressor returns nothing and keeps the pooled, normed value
+# inside its store kernel, so `_v41_latent_from_state_cache` below re-derives it
+# from the state cache the compressor just wrote. That is a second copy of the
+# compressor's pooling rule and it is the one place in this port that is not a
+# straight port of a vendor function; it exists so V4.1 does not have to wait on
+# `compressor.py` returning its latent, and it is written to be the kernel's
+# twin rather than a re-interpretation of it -- same gather positions, same
+# softmax, same RMSNorm, same place where bf16 rounding happens. If
+# `DeepseekCompressor.forward` ever hands the latent over, this function is what
+# it replaces.
+
+
+def _v41_latent_from_state_cache(
+    state_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    positions: torch.Tensor,
+    compress_ratio: int,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+) -> torch.Tensor:
+    """The attention compressor's RoPE-free latent, one row per token.
+
+    Row `i` is the latent of the group token `i` *ends*, built exactly the way
+    `_fused_kv_compress_norm_rope_insert_sparse_attn` builds it: gather the
+    group's `compress_ratio` state rows, softmax the score half, weight the kv
+    half by it, RMSNorm with the compressor's own weight. A token that does not
+    end a group gets the same pooling over a clamped window instead of nothing;
+    those rows are never written to the index key cache (their compressed slot
+    is -1) and exist only so the tensor stays token-aligned.
+
+    Positions before the start of the sequence are masked out of the softmax and
+    contribute zero kv, which is what the kernel does with `mask_pos`.
+
+    Only ratios 1 and 2 reach here -- V4.1's compressed layers -- neither of
+    which overlaps two compression blocks, so the kernel's `head_offset` term
+    (the C4 boundary's second read) has no counterpart.
+    """
+    assert compress_ratio in (1, 2), (
+        f"V4.1 index keys are derived for compress_ratio 1 and 2, got "
+        f"{compress_ratio}"
+    )
+    num_blocks, block_size, state_dim = state_cache.shape
+    state_width = state_dim // 2
+    head_dim = norm_weight.shape[0]
+    assert state_width == head_dim, (
+        f"compressor state row is {state_dim} wide ({state_width} per half) but "
+        f"its norm weight covers {head_dim}; the latent would be mis-sliced."
+    )
+
+    # The group this token ends, in absolute positions. The kernel's
+    # `start = position - (1 + overlap) * ratio + 1` with no overlap.
+    group = torch.arange(compress_ratio, device=positions.device)
+    group_positions = positions.unsqueeze(-1) - compress_ratio + 1 + group
+    valid = group_positions >= 0
+    safe_positions = group_positions.clamp(min=0)
+    # Same slot arithmetic as the kernel: absolute position into the block table.
+    slots = (
+        block_table[token_to_req_indices.long().unsqueeze(-1), safe_positions // block_size]
+        * block_size
+        + safe_positions % block_size
+    )
+    rows = state_cache.reshape(-1, state_dim)[slots]  # [T, ratio, 2 * head_dim]
+
+    keep = valid.unsqueeze(-1)
+    score = rows[..., state_width:].float().masked_fill(~keep, float("-inf"))
+    kv = rows[..., :state_width].float().masked_fill(~keep, 0.0)
+    pooled = (kv * score.softmax(dim=-2)).sum(dim=-2)
+
+    variance = pooled.pow(2).mean(dim=-1, keepdim=True)
+    return pooled * torch.rsqrt(variance + norm_eps) * norm_weight
+
+
+def _v41_index_rope(
+    k: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    group_positions: torch.Tensor,
+    rope_dim: int,
+) -> torch.Tensor:
+    """GPT-J RoPE on the last `rope_dim` dims of `k`, at `group_positions`.
+
+    The same convention as the fused Q kernel (`is_neox=False`: pairs are
+    adjacent, cos/sin are per pair) and as the compressor's store kernel, so the
+    index keys land in the same frame as the index queries that score them.
+
+    `group_positions` is the *compressed* position, `ratio * group_index`, which
+    is the vendor's `freqs_cis[start_pos + 1 - ratio]` for the group that just
+    completed and its prefill spelling for a whole chunk.
+    """
+    assert k.shape[-1] >= rope_dim
+    half = rope_dim // 2
+    cos_sin = cos_sin_cache[group_positions]
+    cos = cos_sin[..., :half].float()
+    sin = cos_sin[..., half:].float()
+    pairs = k[..., -rope_dim:].unflatten(-1, (half, 2)).float()
+    even, odd = pairs[..., 0], pairs[..., 1]
+    roped = torch.stack((even * cos - odd * sin, odd * cos + even * sin), dim=-1)
+    out = k.clone()
+    out[..., -rope_dim:] = roped.flatten(-2).to(k.dtype)
+    return out
 
 
 class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
@@ -464,7 +733,42 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self.topk_indices_buffer = topk_indices_buffer
         self.eager_scratch_pool = eager_scratch_pool
 
+        # Create the compressor for layers with compress_ratio > 1, before the
+        # indexer: a V4.1 index-key owner derives its keys from the latent this
+        # compressor publishes, so it is handed the module. V4.1 compresses at
+        # ratio 1 too, but only its KV sources carry the weights -- the layers
+        # in between read the cache their source wrote.
+        self.compressor = None
+        build_compressor = (
+            self.compress_ratio > 1
+            if self.v41_roles is None
+            else self.v41_roles.owns_compressed_kv
+        )
+        if build_compressor:
+            self.compressor = DeepseekCompressor(
+                vllm_config=vllm_config,
+                compress_ratio=self.compress_ratio,
+                hidden_size=self.hidden_size,
+                head_dim=self.head_dim,
+                rotate=True,
+                prefix=f"{prefix}.compressor",
+                k_cache_prefix=self.prefix,
+                eager_scratch_pool=eager_scratch_pool,
+            )
+
         self.indexer = None
+        # Where this layer publishes the candidate blocks it selects, for the
+        # index sources after it to read. It lives on the attention module
+        # because the indexer op is handed a module *prefix* rather than a
+        # module, and this is the mapping (`static_forward_context`) both ends
+        # already share their caches through -- `_v41_candidate_holder` is the
+        # op's side of it. Only the candidate source has one; see
+        # `V41CandidateBlocks` for why the handover is stamped by forward pass.
+        self.v41_candidate_blocks = (
+            V41CandidateBlocks()
+            if self.v41_roles is not None and self.v41_roles.is_candidate_source
+            else None
+        )
         # V4 gates the indexer on the ratio (only C4A has one); V4.1 names the
         # layers that run one, which is a different set entirely -- the
         # index-only sources 24/28/32/36 have no compressor of their own but do
@@ -475,6 +779,39 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             else self.v41_roles.runs_indexer
         )
         if build_indexer:
+            # This layer's index-key cache is somebody else's when it is not an
+            # owner: the same prefix rewrite the compressed cache uses, one
+            # level down (an index source that does not own `wk`/`k_norm`).
+            index_cache_owner_prefix = ""
+            if (
+                self.v41_roles is not None
+                and not self.v41_roles.owns_index_keys
+                and self.v41_roles.index_owner_layer is not None
+            ):
+                index_cache_owner_prefix = _v41_owner_prefix(
+                    prefix, self.v41_roles.index_owner_layer
+                )
+            # The layer that publishes the candidate blocks every later index
+            # source restricts its own top-k to: its own prefix when it is the
+            # source, the source's when it consumes. An index source *before*
+            # the candidate source (2/8/14) names it too -- `candidate_source_
+            # layer` is set for every V4.1 layer -- but must not read it: the
+            # vendor's rule is `candidate_source_layer < layer_id`, so those
+            # layers score against every reachable position like the source
+            # does, and taking a mask published by a layer that runs later in
+            # the forward would be reading last step's.
+            candidate_source_prefix = ""
+            if self.v41_roles is not None and (
+                self.v41_roles.is_candidate_source
+                or self.v41_roles.uses_candidate_blocks
+            ):
+                candidate_source_prefix = (
+                    prefix
+                    if self.v41_roles.is_candidate_source
+                    else _v41_owner_prefix(
+                        prefix, self.v41_roles.candidate_source_layer
+                    )
+                )
             # aux_stream_list[2] is free here (outer GEMMs joined) for the inner
             # overlap of wq_b+fused_indexer_q_rope_quant vs compressor. None on
             # ROCm, where aux_stream_list is None.
@@ -493,6 +830,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 prefix=f"{prefix}.indexer",
                 aux_stream=indexer_aux_stream,
                 eager_scratch_pool=eager_scratch_pool,
+                v41_roles=self.v41_roles,
+                attention_head_dim=self.head_dim,
+                latent_compressor=self.compressor,
+                index_cache_owner_prefix=index_cache_owner_prefix,
+                candidate_source_prefix=candidate_source_prefix,
+                candidate_topk_blocks=int(
+                    getattr(config, "candidate_topk_blocks", 0) or 0
+                ),
+                candidate_block_size=int(
+                    getattr(config, "candidate_block_size", 0) or 0
+                ),
             )
 
         self._prepare_and_attn_fn = self._prepare_and_attn
@@ -542,29 +890,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         if prefix:
             compilation_config.static_forward_context[prefix] = self
         self.kv_cache = torch.tensor([])
-
-        # Create the compressor for layers with compress_ratio > 1; after the
-        # attention setup above so its KV-cache prefix (self.prefix) is set.
-        # V4.1 compresses at ratio 1 too, but only its KV sources carry the
-        # weights -- the layers in between read the cache their source wrote,
-        # which is what `kv_sharing_target_layer_name` below arranges.
-        self.compressor = None
-        build_compressor = (
-            self.compress_ratio > 1
-            if self.v41_roles is None
-            else self.v41_roles.owns_compressed_kv
-        )
-        if build_compressor:
-            self.compressor = DeepseekCompressor(
-                vllm_config=vllm_config,
-                compress_ratio=self.compress_ratio,
-                hidden_size=self.hidden_size,
-                head_dim=self.head_dim,
-                rotate=True,
-                prefix=f"{prefix}.compressor",
-                k_cache_prefix=self.prefix,
-                eager_scratch_pool=eager_scratch_pool,
-            )
 
         # A V4.1 layer that does not own the compressed cache reads its source's
         # -- the same paged tensor and the same block table -- by name. That is
@@ -780,7 +1105,45 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # Keep Q projection and KV insertion on the default stream. The indexer
         # and MLA compressor use aux streams 0 and 1; aux 2 is internal to the
         # indexer. ROCm runs the same work sequentially without aux streams.
-        if indexer is not None:
+        if indexer is not None and (
+            self.v41_roles is not None and not self.v41_roles.owns_index_keys
+        ):
+            # A V4.1 index-only source: it scores against the index keys a KV
+            # source published and compresses nothing of its own, so there is no
+            # compressor here to overlap with.
+            q = project_query_and_cache_kv()
+            indexer_inputs = indexer(
+                hidden_states,
+                qr,
+                None,
+                indexer_weights,
+                positions,
+                self.indexer_rotary_emb,
+            )
+        elif indexer is not None and self.v41_roles is not None:
+            # A V4.1 index-key owner: the indexer derives its keys from the
+            # latent this compressor writes into the state cache, so the
+            # compressor has to be joined before the indexer runs -- the two
+            # cannot overlap the way V4's can (its indexer has a compressor of
+            # its own and derives nothing from this one).
+            assert compressor is not None
+            aux_stream = aux_streams[0] if aux_streams is not None else None
+            q, _ = maybe_execute_in_parallel(
+                project_query_and_cache_kv,
+                lambda: compressor(kv_score, positions, self.rotary_emb),
+                self.ln_events[0],
+                self.ln_events[1],
+                aux_stream,
+            )
+            indexer_inputs = indexer(
+                hidden_states,
+                qr,
+                None,
+                indexer_weights,
+                positions,
+                self.indexer_rotary_emb,
+            )
+        elif indexer is not None:
             assert compressor is not None
             q, (indexer_inputs, _) = execute_in_parallel(
                 project_query_and_cache_kv,
@@ -800,7 +1163,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 [aux_streams[0], aux_streams[1]] if aux_streams is not None else None,
                 enable=aux_streams is not None,
             )
-            index_q, index_q_scale, index_weights_out = indexer_inputs
         elif compressor is not None:
             aux_stream = aux_streams[0] if aux_streams is not None else None
             q, _ = maybe_execute_in_parallel(
@@ -812,6 +1174,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             )
         else:
             q = project_query_and_cache_kv()
+
+        if indexer is not None:
+            index_q, index_q_scale, index_weights_out = indexer_inputs
 
         self._sparse_indexer_and_attn(
             hidden_states,
@@ -871,15 +1236,20 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 weights, _ = indexer.weights_proj(hidden_states)
                 return weights
 
-            def indexer_compressor_kv_score() -> torch.Tensor:
-                return torch.mm(
-                    hidden_states,
-                    indexer.compressor.fused_wkv_wgate.weight.T,
-                    out_dtype=torch.float32,
-                )
-
             aux_fns[1] = indexer_weights_proj
-            aux_fns[2] = indexer_compressor_kv_score
+            if indexer.compressor is not None:
+                # V4: the indexer's own compressor projects the hidden state to
+                # its latent here. V4.1 has no such projection -- the keys come
+                # off the *attention* compressor's latent instead -- so there is
+                # nothing for this stream to do.
+                def indexer_compressor_kv_score() -> torch.Tensor:
+                    return torch.mm(
+                        hidden_states,
+                        indexer.compressor.fused_wkv_wgate.weight.T,
+                        out_dtype=torch.float32,
+                    )
+
+                aux_fns[2] = indexer_compressor_kv_score
 
         qr_kv, (kv_score, indexer_weights, indexer_kv_score) = execute_in_parallel(
             lambda: self._fused_wqa_wkv_gemm(hidden_states),
@@ -1226,11 +1596,28 @@ class DeepseekV4Indexer(nn.Module):
         prefix: str = "",
         aux_stream: torch.cuda.Stream | None = None,
         eager_scratch_pool: "DeepseekV4EagerScratchPool | None" = None,
+        v41_roles: V41LayerRoles | None = None,
+        attention_head_dim: int = 0,
+        latent_compressor: "DeepseekCompressor | None" = None,
+        index_cache_owner_prefix: str = "",
+        candidate_source_prefix: str = "",
+        candidate_topk_blocks: int = 0,
+        candidate_block_size: int = 0,
     ):
         super().__init__()
         self.vllm_config = vllm_config
         self.config = config
         self.quant_config = quant_config
+        self.v41_roles = v41_roles
+        self.candidate_source_prefix = candidate_source_prefix
+        self.candidate_topk_blocks = candidate_topk_blocks
+        self.candidate_block_size = candidate_block_size
+        # V4's indexer always owns its keys: its own compressor derives them and
+        # writes the cache. V4.1 splits the index sources -- the four that are
+        # also KV sources (2/8/14/20) carry `wk`/`k_norm` and own an index-key
+        # cache, the other four (24/28/32/36) score against the newest owner's
+        # keys and carry neither.
+        self.owns_k = True if v41_roles is None else v41_roles.owns_index_keys
         # self.indexer_cfg = config.attn_module_list_cfg[0]["attn_index"]
         self.topk_tokens = config.index_topk
         self.n_head = config.index_n_heads  # 64
@@ -1259,6 +1646,30 @@ class DeepseekV4Indexer(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.weights_proj",
         )
+        # V4.1's index keys, in place of V4's indexer-local compressor: `wk`
+        # projects the *attention* compressor's latent (512 wide) down to the
+        # index head dim and `k_norm` normalizes it, which is the vendor's
+        # `k = k_norm(wk(latent))`. Only a key owner has these tensors.
+        self.attention_head_dim = attention_head_dim
+        self.wk = None
+        self.k_norm = None
+        if self.owns_k and v41_roles is not None:
+            assert attention_head_dim > 0, (
+                "V4.1 index keys are projected from the attention head dim; "
+                "the attention layer has to pass it in."
+            )
+            self.wk = ReplicatedLinear(
+                attention_head_dim,
+                self.head_dim,
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.wk",
+            )
+            self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
+        # The attention compressor, when this layer owns one. Its state cache is
+        # where the latent comes from and its `norm` is the weight that normed
+        # it; V4's indexer has a compressor of its own below instead.
+        self.latent_compressor = latent_compressor
         self.softmax_scale = self.head_dim**-0.5
 
         self.scale_fmt = "ue8m0"
@@ -1286,24 +1697,52 @@ class DeepseekV4Indexer(nn.Module):
             k_cache_head_dim = (
                 self.head_dim + self.head_dim // self.quant_block_size * 4
             )
-        self.k_cache = DeepseekV4IndexerCache(
-            head_dim=k_cache_head_dim,
-            dtype=torch.uint8,
-            prefix=f"{prefix}.k_cache",
-            cache_config=cache_config,
-            compress_ratio=self.compress_ratio,
-        )
-        self.compressor = DeepseekCompressor(
-            vllm_config=vllm_config,
-            compress_ratio=self.compress_ratio,
-            hidden_size=hidden_size,
-            head_dim=self.head_dim,
-            rotate=True,
-            prefix=f"{prefix}.compressor",
-            k_cache_prefix=self.k_cache.prefix,
-            use_fp4_cache=self.use_fp4_kv,
-            eager_scratch_pool=eager_scratch_pool,
-        )
+        self.use_pcp = vllm_config.parallel_config.prefill_context_parallel_size > 1
+        self.k_cache: DeepseekV4IndexerCache
+        if v41_roles is not None and not self.owns_k:
+            # Scores against the keys a KV source published, so it reads that
+            # layer's cache rather than getting one of its own -- the V4.1
+            # layers in between a source and its consumers do the same for the
+            # compressed KV cache (`compressed_kv_cache`). A cache module of its
+            # own would declare a spec and get a paged tensor nothing ever
+            # writes, so the module itself is the thing to share, not a name.
+            registry = vllm_config.compilation_config.static_forward_context
+            owner_key = f"{index_cache_owner_prefix}.indexer.k_cache"
+            if owner_key not in registry:
+                raise ValueError(
+                    f"DeepSeek-V4.1: {prefix} scores against the index keys of "
+                    f"{index_cache_owner_prefix or 'an unnamed layer'}, but that "
+                    f"layer's index cache ({owner_key!r}) has not been built. "
+                    "Layers are constructed in order, so this means the owner "
+                    "is not an index-key owner at all."
+                )
+            self.k_cache = cast("DeepseekV4IndexerCache", registry[owner_key])
+        else:
+            self.k_cache = DeepseekV4IndexerCache(
+                head_dim=k_cache_head_dim,
+                dtype=torch.uint8,
+                prefix=f"{prefix}.k_cache",
+                cache_config=cache_config,
+                compress_ratio=self.compress_ratio,
+            )
+        # V4's indexer compressor (its own wkv/wgate over the hidden state, its
+        # own state cache) does not exist in V4.1: the checkpoint carries no
+        # such tensors, and the keys are derived from the attention compressor's
+        # latent instead. Building it would both fail to load and write the
+        # wrong keys.
+        self.compressor = None
+        if v41_roles is None:
+            self.compressor = DeepseekCompressor(
+                vllm_config=vllm_config,
+                compress_ratio=self.compress_ratio,
+                hidden_size=hidden_size,
+                head_dim=self.head_dim,
+                rotate=True,
+                prefix=f"{prefix}.compressor",
+                k_cache_prefix=self.k_cache.prefix,
+                use_fp4_cache=self.use_fp4_kv,
+                eager_scratch_pool=eager_scratch_pool,
+            )
 
         self.indexer_op = SparseAttnIndexer(
             self.k_cache,
@@ -1314,9 +1753,19 @@ class DeepseekV4Indexer(nn.Module):
             self.max_model_len,
             self.max_total_seq_len,
             self.topk_indices_buffer,
+            # V4's nested compressor writes the key cache; V4.1 derives the keys
+            # in `_v41_write_index_keys` below, which also has to work for the
+            # short-context shortcut where the op is skipped but the keys are
+            # still owed to every later step.
             skip_k_cache_insert=True,
             use_fp4_cache=self.use_fp4_kv,
             compress_ratio=self.compress_ratio,
+            is_candidate_source=(
+                False if v41_roles is None else v41_roles.is_candidate_source
+            ),
+            candidate_source_prefix=candidate_source_prefix,
+            candidate_topk_blocks=candidate_topk_blocks,
+            candidate_block_size=candidate_block_size,
         )
 
         # None on ROCm — maybe_execute_in_parallel falls back to sequential.
@@ -1326,11 +1775,86 @@ class DeepseekV4Indexer(nn.Module):
             torch.cuda.Event(),
         ]
 
+    def _v41_write_index_keys(
+        self,
+        positions: torch.Tensor,
+        rotary_emb: nn.Module,
+        attn_metadata: dict[str, Any],
+    ) -> torch.Tensor:
+        """Derive and store this layer's index keys (V4.1 key owners).
+
+        `latent` -> `wk` -> `k_norm` -> RoPE at the group's position -> quantized
+        insert into the index key cache, which is the vendor's `Indexer.forward`
+        key path. Returns the keys, for tests and callers that want them.
+
+        This is the one place where V4.1's keys are produced, and it runs on
+        every call that touches tokens -- including the short-context shortcut,
+        where the top-k is trivial but the cache still has to grow, or every
+        later decode step would score against keys that are not there.
+
+        The attention compressor must have run already: the latent is gathered
+        out of the state cache it writes (`_v41_latent_from_state_cache`), which
+        is why `_prepare_and_attn` joins it before the indexer for these layers
+        instead of overlapping the two.
+        """
+        compressor = self.latent_compressor
+        assert compressor is not None, (
+            f"{self.prefix} owns index keys but has no attention compressor to "
+            "derive them from; a V4.1 index-key owner is a KV source."
+        )
+        assert self.wk is not None and self.k_norm is not None
+        state_metadata = cast(Any, attn_metadata[compressor.state_cache.prefix])
+        index_metadata = cast(Any, attn_metadata[self.k_cache.prefix])
+        slot_mapping = index_metadata.slot_mapping
+        # Spec decode may pad the batch past the tokens the metadata covers (the
+        # sparse indexer op truncates for the same reason).
+        num_tokens = slot_mapping.shape[0]
+        if self.use_pcp:
+            num_tokens //= get_pcp_group().world_size
+        assert num_tokens <= positions.shape[0], (
+            f"index key metadata covers {num_tokens} tokens but only "
+            f"{positions.shape[0]} positions were passed"
+        )
+        positions = positions[:num_tokens]
+
+        latent = _v41_latent_from_state_cache(
+            compressor.state_cache.kv_cache,
+            state_metadata.block_table,
+            state_metadata.token_to_req_indices,
+            positions,
+            self.compress_ratio,
+            compressor.norm.weight,
+            compressor.rms_norm_eps,
+        )
+        k, _ = self.wk(latent.to(self.wk.weight.dtype))
+        k = self.k_norm(k)
+        # A latent stands for the first token of its group, so group `g` is
+        # roped at position `g * ratio` -- the vendor's
+        # `freqs_cis[start_pos + 1 - ratio]` for a completed group.
+        group_positions = (positions // self.compress_ratio) * self.compress_ratio
+        k = _v41_index_rope(
+            k, rotary_emb.cos_sin_cache, group_positions, self.rope_dim
+        )
+        k, cache_slot_mapping = maybe_gather_indexer_k(
+            k, slot_mapping, index_metadata.num_decode_tokens, self.use_pcp
+        )
+        # -1 slots (a token that does not end a group, at ratio 2) are skipped
+        # by the kernel, which is what keeps the derivation's per-token shape
+        # composable with a per-compressed-position cache.
+        ops.indexer_k_quant_and_cache(
+            k,
+            self.k_cache.kv_cache,
+            cache_slot_mapping,
+            self.quant_block_size,
+            self.scale_fmt,
+        )
+        return k
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         qr: torch.Tensor,
-        compressed_kv_score: torch.Tensor,
+        compressed_kv_score: torch.Tensor | None,
         indexer_weights: torch.Tensor,
         positions: torch.Tensor,
         rotary_emb: nn.Module,
@@ -1346,7 +1870,10 @@ class DeepseekV4Indexer(nn.Module):
             ):
                 # candidates num smaller than topk, every candidate is selected
                 # but we still need to build k cache
-                compressor(compressed_kv_score, positions, rotary_emb)
+                if compressor is not None:
+                    compressor(compressed_kv_score, positions, rotary_emb)
+                elif self.owns_k:
+                    self._v41_write_index_keys(positions, rotary_emb, attn_metadata)
                 assert self.topk_indices_buffer is not None
                 num_tokens = (
                     indexer_metadata.num_decode_tokens
@@ -1377,15 +1904,26 @@ class DeepseekV4Indexer(nn.Module):
                 use_fp4=self.use_fp4_kv,
             )
 
-        # compressor returns None and writes K to the indexer KV cache; the
-        # join orders that write before indexer_op (skip_k_cache_insert=True).
-        (q_quant, weights), _ = maybe_execute_in_parallel(
-            wq_b_and_q_quant,
-            lambda: compressor(compressed_kv_score, positions, rotary_emb),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
+        if compressor is not None:
+            # compressor returns None and writes K to the indexer KV cache; the
+            # join orders that write before indexer_op (skip_k_cache_insert=True).
+            (q_quant, weights), _ = maybe_execute_in_parallel(
+                wq_b_and_q_quant,
+                lambda: compressor(compressed_kv_score, positions, rotary_emb),
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+            )
+        else:
+            # V4.1: the keys are derived from the attention compressor's state
+            # cache, which the caller has already joined -- it cannot overlap
+            # the indexer the way V4's own compressor does, but the query side
+            # has nothing to wait for either. A dummy run has no metadata and
+            # nothing to write (the compressor returns early for the same
+            # reason).
+            if self.owns_k and isinstance(attn_metadata, dict):
+                self._v41_write_index_keys(positions, rotary_emb, attn_metadata)
+            q_quant, weights = wq_b_and_q_quant()
         if isinstance(q_quant, tuple):
             q, q_scale = q_quant
         else:

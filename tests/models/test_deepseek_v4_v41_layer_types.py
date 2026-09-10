@@ -45,6 +45,12 @@ def _v41_config() -> types.SimpleNamespace:
         compress_ratios=list(V41_COMPRESS_RATIOS),
         kv_source_layer_ids=[2, 8, 14, 20],
         index_source_layer_ids=[2, 8, 14, 20, 24, 28, 32, 36],
+        # The three that turn the two-level top-k on. Without them the roles
+        # still resolve, but every candidate field comes back off, so a test
+        # that means to exercise the candidate path silently does not.
+        candidate_source_layer_id=20,
+        candidate_topk_blocks=2048,
+        candidate_block_size=8,
     )
 
 

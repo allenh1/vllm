@@ -45,6 +45,29 @@ class HummingFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
     def can_implement(
         cls, config: FP8ScaledMMLinearLayerConfig
     ) -> tuple[bool, str | None]:
+        # `process_weights_after_loading` takes the block-scale branch when
+        # the group shape is none of per-tensor/per-channel/per-group, and
+        # that branch emits `weight_scale_group_size_n = group_shape.row`.
+        # The humming kernel then asserts that value is >= 64
+        # (`humming/kernel/humming.py`, `check_scale`), which a 32-block
+        # weight -- DeepSeek-V4.1 ships `weight_block_size: [32, 32]` --
+        # cannot satisfy. Claiming the layer and dying at kernel build takes
+        # the whole engine down, so decline it here and let the priority
+        # list fall through to the Triton block-FP8 path, which handles any
+        # block size.
+        group_shape = config.weight_quant_key.scale.group_shape
+        is_block = not (
+            group_shape.is_per_tensor()
+            or group_shape.is_per_channel()
+            or group_shape.is_per_group()
+        )
+        if is_block and 0 < group_shape.row < 64:
+            return False, (
+                "Humming's block GEMM requires a weight-scale group size of "
+                f"at least 64 along the output axis; this layer's is "
+                f"{group_shape.row}. Falling through to the next kernel in "
+                "the priority list."
+            )
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:

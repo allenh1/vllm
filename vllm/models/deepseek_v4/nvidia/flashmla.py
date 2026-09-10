@@ -446,10 +446,21 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         attn_metadata: DeepseekV4FlashMLAMetadata,
         output: torch.Tensor,
     ) -> None:
-        if layer.compress_ratio not in (4, 128):
+        # The kernels below never see the ratio. They see the number of latents
+        # in one physical cache page, derived below and handed over as a runtime
+        # (or constexpr) scalar: `block_idx = slot_id // cache_block_size`,
+        # `pos_in_block = slot_id % cache_block_size`. V4's ratios 4 and 128
+        # give 64 and 2; V4.1's 1 and 2 give 256 and 128. This guard is here to
+        # catch a ratio that would silently truncate in that division, not to
+        # enumerate the two values V4 happened to use.
+        if (
+            layer.compress_ratio <= 0
+            or attn_metadata.block_size % layer.compress_ratio != 0
+        ):
             raise NotImplementedError(
-                "Triton sparse MLA compressed decode currently supports "
-                f"compress_ratio=4 or 128, got {layer.compress_ratio}"
+                "Triton sparse MLA compressed decode needs the compression ratio "
+                "to divide the block size evenly; got block_size="
+                f"{attn_metadata.block_size}, compress_ratio={layer.compress_ratio}"
             )
 
         num_decodes = swa_metadata.num_decodes

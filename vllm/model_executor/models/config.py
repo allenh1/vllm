@@ -325,28 +325,38 @@ class DiffusionGemmaModelForBlockDiffusionConfig(VerifyAndUpdateConfig):
 
 
 class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):
+    #: model_types this hook rewrites. V4.1 reports `deepseek_v41` at the top
+    #: level and `deepseek_v41_text` on the nested text config.
+    DSV4_MODEL_TYPES = (
+        "deepseek_v4",
+        "deepseek_v41",
+        "deepseek_v41_text",
+    )
+
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
-        quant_config = getattr(model_config.hf_config, "quantization_config", None)
-        if quant_config is not None and quant_config.get("quant_method") == "fp8":
-            model_type = getattr(model_config.hf_config, "model_type", None)
-            if model_type in ("deepseek_v4", "deepseek_v41", "deepseek_v41_text"):
-                model_config.hf_config.quantization_config["quant_method"] = (
-                    "deepseek_v4_fp8"
-                )
-
-        hf_text_quant_config = getattr(
-            model_config.hf_text_config, "quantization_config", None
-        )
-        if (
-            hf_text_quant_config is not None
-            and hf_text_quant_config.get("quant_method") == "fp8"
-        ):
+        model_type = getattr(model_config.hf_config, "model_type", None)
+        if model_type not in DeepseekV4ForCausalLMConfig.DSV4_MODEL_TYPES:
             model_type = getattr(model_config.hf_text_config, "model_type", None)
-            if model_type in ("deepseek_v4", "deepseek_v41", "deepseek_v41_text"):
-                model_config.hf_text_config.quantization_config["quant_method"] = (
-                    "deepseek_v4_fp8"
-                )
+        if model_type not in DeepseekV4ForCausalLMConfig.DSV4_MODEL_TYPES:
+            return
+
+        # `model_arch_config` carries the quant config `_verify_quantization`
+        # actually resolves from; the two hf configs carry the one the loader
+        # reads back. Patch every copy that holds an fp8 method.
+        for cfg in (
+            model_config.hf_config,
+            model_config.hf_text_config,
+            getattr(model_config, "model_arch_config", None),
+        ):
+            if cfg is None:
+                continue
+            quant_config = getattr(cfg, "quantization_config", None)
+            if (
+                isinstance(quant_config, dict)
+                and quant_config.get("quant_method") == "fp8"
+            ):
+                quant_config["quant_method"] = "deepseek_v4_fp8"
 
 
 class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):

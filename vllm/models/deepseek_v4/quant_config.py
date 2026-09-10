@@ -63,7 +63,14 @@ class DeepseekV4FP8Config(Fp8Config):
                 # vllm_config not yet set; defer the decision until a
                 # later call lands inside set_current_vllm_config.
                 return "fp4"
-            expert_dtype = getattr(hf_config, "expert_dtype", "fp4")
+            expert_dtype = getattr(hf_config, "expert_dtype", None)
+            if expert_dtype is None:
+                nested = getattr(hf_config, "quantization_config", None)
+                expert_dtype = (
+                    nested.get("expert_dtype", "fp4")
+                    if isinstance(nested, dict)
+                    else "fp4"
+                )
             if expert_dtype not in _DEEPSEEK_V4_EXPERT_DTYPES:
                 raise ValueError(
                     f"Unsupported DeepSeek V4 expert_dtype={expert_dtype!r}; "
@@ -147,7 +154,11 @@ class DeepseekV4FP8Config(Fp8Config):
         ):
             return None
         model_type = getattr(hf_config, "model_type", None)
-        if model_type == "deepseek_v4" or user_quant == "deepseek_v4_fp8":
+        if model_type in (
+            "deepseek_v4",
+            "deepseek_v41",
+            "deepseek_v41_text",
+        ) or user_quant == "deepseek_v4_fp8":
             return "deepseek_v4_fp8"
         return None
 

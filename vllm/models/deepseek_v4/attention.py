@@ -566,17 +566,28 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 eager_scratch_pool=eager_scratch_pool,
             )
 
-        # Cross-layer KV sharing: a V4.1 layer that does not own the compressed
-        # cache declares which layer's it reads, and the worker then puts it in
-        # that layer's KV-cache group, so it is handed the same paged tensor and
-        # the same block table. `swa_cache` is deliberately left out -- the
-        # sliding window is per-layer in V4.1, only the compressed positions are
-        # shared.
-        self.kv_sharing_target_layer_name = None
+        # A V4.1 layer that does not own the compressed cache reads its source's
+        # -- the same paged tensor and the same block table -- by name. That is
+        # the mechanism the compressor already uses to find its own cache
+        # (`_static_forward_context[k_cache_prefix]` + `attn_metadata[...]`),
+        # and it is the one that works here: vLLM's own cross-layer sharing
+        # (`kv_sharing_target_layer_name`) is discovered through
+        # `get_layers_from_vllm_config(config, Attention)`, and this class is
+        # an AttentionLayerBase but not an Attention, so declaring the
+        # attribute would silently leave the layer with no cache at all and an
+        # empty tensor in `forward_mqa`.
+        #
+        # `swa_cache` is deliberately not shared: V4.1's sliding window is
+        # per-layer, only the compressed positions are common.
+        self.compressed_cache_prefix = None
         if self.v41_roles is not None and self.v41_roles.kv_owner_layer is not None:
-            self.kv_sharing_target_layer_name = _v41_owner_prefix(
+            self.compressed_cache_prefix = _v41_owner_prefix(
                 prefix, self.v41_roles.kv_owner_layer
             )
+        # The name the compressed cache's attention metadata is published under:
+        # this layer's own, or its source's.
+        self.compressed_metadata_prefix = self.compressed_cache_prefix or prefix
+        self._static_forward_context = compilation_config.static_forward_context
 
     @staticmethod
     def _q_padded_scratch_device_index(device: torch.device) -> int:
@@ -1033,6 +1044,37 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # [B, H=1, N, C] -> [B, N, C]
         self.kv_cache = kv_cache.squeeze(1)
 
+    def compressed_kv_cache(self) -> torch.Tensor:
+        """The paged compressed-KV cache this layer reads.
+
+        Its own for every V4 layer and for V4.1's KV sources; its source's for
+        the V4.1 layers in between. Looked up by prefix rather than captured at
+        construction because the worker binds the tensors afterwards.
+        """
+        if self.compressed_cache_prefix is None:
+            return self.kv_cache
+        return self._static_forward_context[self.compressed_cache_prefix].kv_cache
+
+    def compressed_cache_and_metadata(self, attn_metadata) -> tuple[Any, Any]:
+        """The paged compressed cache this layer attends over, and its metadata.
+
+        `(None, None)` for a layer that does not compress at all -- the
+        SWA-only case. `attn_metadata` is the per-step dict keyed by module
+        prefix, and only the owner of a compressed cache is in a KV-cache group
+        and so has an entry of its own; the V4.1 layers reading it find the
+        owner's.
+        """
+        if self.v41_roles is None:
+            compresses = self.compress_ratio > 1
+        else:
+            compresses = self.v41_roles.compression_enabled
+        if not compresses:
+            return None, None
+        return (
+            self.compressed_kv_cache(),
+            attn_metadata[self.compressed_metadata_prefix],
+        )
+
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.backend_cls
 
@@ -1047,9 +1089,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         if not compresses:
             # SWA part only. Allocated separately as DeepseekV4SWACache.
             return None
-        if self.kv_sharing_target_layer_name is not None:
-            # Reads its source's paged cache; declaring a spec here would
-            # allocate a second copy that nothing ever writes.
+        if self.compressed_cache_prefix is not None:
+            # Reads its source's paged cache. Declaring a spec here would
+            # allocate a second copy that nothing ever writes -- and being in
+            # no KV-cache group is fine, because the group it needs to be in is
+            # already the owner's, and it finds it by prefix.
             return None
         # fp8_ds_mla is a UE8M0 block-scaled uint8 layout and needs 576B
         # alignment; plain bf16 / per-tensor fp8 rows use natural element-size

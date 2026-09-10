@@ -314,8 +314,14 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             return
 
         assert isinstance(attn_metadata, dict)
+        # Own compressed cache, or -- for a DeepSeek-V4.1 layer between two KV
+        # sources -- the one its source owns. (None, None) when the layer does
+        # not compress, i.e. is SWA-only and has no compressed cache to read.
+        self_kv_cache, flashmla_metadata = self.compressed_cache_and_metadata(
+            attn_metadata
+        )
         flashmla_metadata = cast(
-            DeepseekV4FlashMLAMetadata | None, attn_metadata.get(self.prefix)
+            DeepseekV4FlashMLAMetadata | None, flashmla_metadata
         )
         swa_metadata = cast(
             "DeepseekSparseSWAMetadata | None",
@@ -323,10 +329,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         )
         assert swa_metadata is not None
 
-        swa_only = self.compress_ratio <= 1
-        # SWA-only layers (compress_ratio <= 1) don't have their own KV cache
-        # allocation, so self.kv_cache may be empty after profiling cleanup.
-        self_kv_cache = self.kv_cache if not swa_only else None
+        swa_only = self_kv_cache is None
         swa_kv_cache = self.swa_cache_layer.kv_cache
 
         # Split prefill and decode

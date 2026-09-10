@@ -332,7 +332,7 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
             compressed_block_table = attn_metadata.block_table[:num_reqs]
             compressed_block_size = attn_metadata.block_size // self.compress_ratio
 
-            if self.compress_ratio == 4:
+            if self.uses_indexer_topk:
                 assert self.topk_indices_buffer is not None
                 if num_prefill_tokens > 0:
                     prefill_topk_indices = self.topk_indices_buffer[
@@ -383,11 +383,20 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
         assert seq_lens.dtype == torch.int32
         # cache for SWA-only and C128A that build the same mixed sparse indices
         # C4A stays uncached.
-        cache_key = (
-            "swa_only"
-            if swa_only
-            else ("c128a" if self.compress_ratio == 128 else "c4a")
-        )
+        if swa_only:
+            cache_key = "swa_only"
+        elif self.v41_roles is None:
+            cache_key = "c128a" if self.compress_ratio == 128 else "c4a"
+        else:
+            # V4.1: same-type layers can read *different* source caches -- the
+            # ratio-2 layers 3..7 read layer 2's, 9..13 read layer 8's, 15..19
+            # read layer 14's -- and the packed block span is derived from the
+            # cache, so the source belongs in the key. V4 has one cache per
+            # layer, but only one cache per layer *type* is ever read in a step,
+            # which is why it gets away with the type alone.
+            cache_key = (
+                f"{self.tile_sched_layer_type()}:{self.compressed_metadata_prefix}"
+            )
         cached_sparse = swa_metadata.flashinfer_sparse_index_cache.get(cache_key, None)
         if cached_sparse is None:
             swa_block_span = _packed_block_span(swa_k_cache)
@@ -737,7 +746,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                     "SWA validity metadata is required for compressed layers."
                 )
             is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
-            if self.compress_ratio == 4:
+            if self.uses_indexer_topk:
                 if self.topk_indices_buffer is None:
                     raise RuntimeError(
                         "C4A decode requires top-k indices from the indexer."
@@ -807,7 +816,8 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         attn_metadata: DeepseekV4FlashMLAMetadata | None,
         swa_metadata: "DeepseekSparseSWAMetadata",
     ) -> None:
-        swa_only = self.compress_ratio <= 1
+        # Not `compress_ratio <= 1`: V4.1's ratio-1 layers compress too.
+        swa_only = not self.compresses
 
         num_prefills = swa_metadata.num_prefills
         num_decodes = swa_metadata.num_decodes
@@ -821,7 +831,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         local_topk_indices: torch.Tensor | None
         if swa_only:
             local_topk_indices = None
-        elif self.compress_ratio == 4:
+        elif self.uses_indexer_topk:
             if self.topk_indices_buffer is None:
                 raise RuntimeError(
                     "C4A prefill requires top-k indices from the indexer."

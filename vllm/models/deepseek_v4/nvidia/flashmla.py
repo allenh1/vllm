@@ -167,7 +167,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         cls,
         layer: "DeepseekV4FlashMLAAttention",
     ) -> int:
-        if layer.compress_ratio <= 1:
+        if not layer.compresses:
             return 0
         if (
             layer.topk_indices_buffer is not None
@@ -212,7 +212,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 window_size=window_size,
             )
         )
-        if compress_ratio <= 1:
+        if not layer.compresses:
             m_bound = max_gather_len
         else:
             compressed_region_size = max_model_len // compress_ratio
@@ -787,8 +787,9 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             assert swa_metadata.is_valid_token is not None
             block_size = attn_metadata.block_size // self.compress_ratio
             is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
-            if self.compress_ratio == 4:
-                # C4A: local indices differ per layer (filled by Indexer).
+            if self.uses_indexer_topk:
+                # C4A, and V4.1's ratios 1 and 2: local indices filled by the
+                # Indexer, converted to global slots here.
                 assert self.topk_indices_buffer is not None
                 global_indices, topk_lens = compute_global_topk_indices_and_lens(
                     self.topk_indices_buffer[:num_decode_tokens],
@@ -853,17 +854,9 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         # and num_splits via PyTorch's graph-aware allocator so CUDA graph
         # capture reuses the same addresses on replay); subsequent same-type
         # layers see have_initialized=True and skip the planner.
-        if self.compress_ratio <= 1:
-            tile_metadata = swa_metadata.tile_sched_swaonly
-        elif self.compress_ratio == 4:
-            tile_metadata = swa_metadata.tile_sched_c4a
-        elif self.compress_ratio == 128:
-            tile_metadata = swa_metadata.tile_sched_c128a
-        else:
-            raise ValueError(
-                f"Unsupported compress_ratio={self.compress_ratio}; "
-                "expected 1, 4, or 128."
-            )
+        tile_metadata = getattr(
+            swa_metadata, f"tile_sched_{self.tile_sched_layer_type()}"
+        )
         assert tile_metadata is not None, (
             "swa_metadata missing tile_sched entry for "
             f"compress_ratio={self.compress_ratio}; "
@@ -922,7 +915,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         prefill_token_base = query_start_loc_cpu[num_decodes]
 
         if not swa_only:
-            if self.compress_ratio == 4:
+            if self.uses_indexer_topk:
                 assert self.topk_indices_buffer is not None
                 topk_indices = self.topk_indices_buffer[num_decode_tokens:]
                 topk_indices = topk_indices[:num_prefill_tokens]
@@ -965,7 +958,11 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         # and total (chunk_M) widths. Replaces the fixed PREFILL_CHUNK_SIZE
         # chunking with batch-wide M/N.
         chunk_plan = swa_metadata.get_prefill_chunk_plan(
-            compress_ratio=int(self.compress_ratio),
+            # 0 when this layer has no compressed region at all, which drops the
+            # compressed term out of the workspace-area bound below. V4 spells
+            # that case with a ratio of 1; V4.1 compresses *at* ratio 1, so the
+            # ratio alone cannot say it.
+            compress_ratio=int(self.compress_ratio) if self.compresses else 0,
             prefill_chunk_size=self.PREFILL_CHUNK_SIZE,
         )
         assert chunk_plan, "prefill chunk plan must be non-empty when num_prefills > 0"

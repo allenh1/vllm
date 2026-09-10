@@ -159,9 +159,12 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4FlashMLAAttention):
         )
 
     def _reserve_sm120_decode_workspace(self) -> None:
-        if self.compress_ratio <= 1:
+        if not self.compresses:
             extra_topk = 0
-        elif self.compress_ratio == 4:
+        elif self.uses_indexer_topk:
+            # V4's C4A and every compressed V4.1 layer (ratios 1 and 2): the
+            # sparse set is the indexer's top-k, so the workspace has to admit
+            # all of `index_topk` for each row.
             assert self.topk_indices_buffer is not None
             extra_topk = self.topk_indices_buffer.shape[-1]
         elif self.compress_ratio == 128:
@@ -237,7 +240,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4FlashMLAAttention):
             assert swa_metadata.is_valid_token is not None
             block_size = attn_metadata.block_size // self.compress_ratio
             is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
-            if self.compress_ratio == 4:
+            if self.uses_indexer_topk:
                 assert self.topk_indices_buffer is not None
                 global_indices, topk_lens = compute_global_topk_indices_and_lens(
                     self.topk_indices_buffer[:num_decode_tokens],
@@ -380,7 +383,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4FlashMLAAttention):
         if not swa_only:
             assert attn_metadata is not None
             block_size = attn_metadata.block_size // self.compress_ratio
-            if self.compress_ratio == 4:
+            if self.uses_indexer_topk:
                 assert self.topk_indices_buffer is not None
                 prefill_local = self.topk_indices_buffer[num_decode_tokens:num_tokens]
                 # Rebase the indexer's BATCH-GLOBAL compressed top-k positions

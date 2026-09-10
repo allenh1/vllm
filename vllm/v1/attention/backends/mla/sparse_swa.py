@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass, field
-from typing import ClassVar, cast
+from typing import Any, ClassVar, cast
 
 import torch
 
@@ -46,9 +46,47 @@ logger = init_logger(__name__)
 _LAYER_TYPE_SWAONLY = "swaonly"
 _LAYER_TYPE_C4A = "c4a"
 _LAYER_TYPE_C128A = "c128a"
+# DeepSeek-V4.1 spells the same field differently: the raw entry is the pooling
+# width, so 0 is the only SWA-only value and 1 and 2 are both *compressed* (one
+# latent per token, and two tokens pooled per latent). Neither matches V4's c4a
+# geometry -- they differ from it, and from each other, in compressed rows per
+# page -- so each gets its own type here rather than borrowing c4a's plan.
+_LAYER_TYPE_C1A = "c1a"
+_LAYER_TYPE_C2A = "c2a"
+_LAYER_TYPE_NAMES = (
+    _LAYER_TYPE_SWAONLY,
+    _LAYER_TYPE_C4A,
+    _LAYER_TYPE_C128A,
+    _LAYER_TYPE_C1A,
+    _LAYER_TYPE_C2A,
+)
 
 
-def _layer_type_for(compress_ratio: int) -> str:
+def is_deepseek_v41_config(hf_config: Any) -> bool:
+    """Whether ``hf_config`` is a V4.1 config.
+
+    Mirrors :func:`vllm.models.deepseek_v4.attention.is_deepseek_v41`, which is
+    where the meaning is documented; repeated here rather than imported because
+    the model package imports this backend, not the other way round.
+    """
+    return getattr(hf_config, "kv_source_layer_ids", None) is not None
+
+
+def _layer_type_for(compress_ratio: int, v41: bool = False) -> str:
+    if v41:
+        # V4.1: raw 0 is uncompressed, 1 and 2 are compressed. V4 spells a raw
+        # 1 as "uncompressed", which is why this cannot be folded into the
+        # branch below -- the same number means opposite things.
+        if compress_ratio <= 0:
+            return _LAYER_TYPE_SWAONLY
+        if compress_ratio == 1:
+            return _LAYER_TYPE_C1A
+        if compress_ratio == 2:
+            return _LAYER_TYPE_C2A
+        raise ValueError(
+            f"Unsupported DeepseekV4.1 compress_ratio={compress_ratio}; "
+            "expected 0, 1, or 2."
+        )
     if compress_ratio <= 1:
         return _LAYER_TYPE_SWAONLY
     if compress_ratio == 4:
@@ -207,6 +245,9 @@ class DeepseekSparseSWAMetadata:
     tile_sched_swaonly: "FlashMLASchedMeta | None" = None
     tile_sched_c4a: "FlashMLASchedMeta | None" = None
     tile_sched_c128a: "FlashMLASchedMeta | None" = None
+    # DeepSeek-V4.1's two compressed ratios; see `_layer_type_for`.
+    tile_sched_c1a: "FlashMLASchedMeta | None" = None
+    tile_sched_c2a: "FlashMLASchedMeta | None" = None
     flashinfer_sparse_index_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = field(
         default_factory=dict
     )
@@ -430,9 +471,10 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # FlashMLA tile-scheduler plan for types that will actually be called.
         # Models without compress_ratios (pure SWA) fall back to swaonly.
         compress_ratios = getattr(hf_config, "compress_ratios", None) or [1]
+        self._is_v41 = is_deepseek_v41_config(hf_config)
         self._layer_types: set[str] = set()
         for ratio in compress_ratios:
-            self._layer_types.add(_layer_type_for(int(ratio)))
+            self._layer_types.add(_layer_type_for(int(ratio), v41=self._is_v41))
 
         max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
         self.token_to_req_indices = torch.zeros(
@@ -677,6 +719,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             tile_sched_swaonly=tile_sched[_LAYER_TYPE_SWAONLY],
             tile_sched_c4a=tile_sched[_LAYER_TYPE_C4A],
             tile_sched_c128a=tile_sched[_LAYER_TYPE_C128A],
+            tile_sched_c1a=tile_sched[_LAYER_TYPE_C1A],
+            tile_sched_c2a=tile_sched[_LAYER_TYPE_C2A],
             **deepseek_v4_fields,  # type: ignore[arg-type]
         )
 
@@ -709,9 +753,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             TRITON_BLOCK_SIZE=1024,
         )
         tile_sched = self.build_tile_scheduler(metadata.num_decode_tokens)
-        metadata.tile_sched_swaonly = tile_sched[_LAYER_TYPE_SWAONLY]
-        metadata.tile_sched_c4a = tile_sched[_LAYER_TYPE_C4A]
-        metadata.tile_sched_c128a = tile_sched[_LAYER_TYPE_C128A]
+        for layer_type in _LAYER_TYPE_NAMES:
+            setattr(metadata, f"tile_sched_{layer_type}", tile_sched[layer_type])
         metadata.flashinfer_sparse_index_cache.clear()
 
     def build_tile_scheduler(
@@ -729,9 +772,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         ``_forward_decode`` sees a clean sentinel.
         """
         out: dict[str, FlashMLASchedMeta | None] = {
-            _LAYER_TYPE_SWAONLY: None,
-            _LAYER_TYPE_C4A: None,
-            _LAYER_TYPE_C128A: None,
+            layer_type: None for layer_type in _LAYER_TYPE_NAMES
         }
         if (
             num_decode_tokens == 0

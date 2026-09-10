@@ -1055,6 +1055,67 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             return self.kv_cache
         return self._static_forward_context[self.compressed_cache_prefix].kv_cache
 
+    @property
+    def compresses(self) -> bool:
+        """Whether this layer attends over compressed positions at all.
+
+        Not `compress_ratio > 1`: V4.1 reads a raw 1 as one latent per token,
+        i.e. compressed, where V4 reads it as uncompressed. The operational
+        ratio is clamped to >= 1 on both, so it cannot answer this on its own.
+        """
+        if self.v41_roles is None:
+            return self.compress_ratio > 1
+        return self.v41_roles.compression_enabled
+
+    @property
+    def uses_indexer_topk(self) -> bool:
+        """Whether the compressed positions are the indexer's top-k.
+
+        True for V4's ratio-4 layers and for every compressed V4.1 layer --
+        ratios 1 and 2 are both indexer-driven there. V4's ratio-128 layers are
+        the exception: their sparse set is decided when the metadata is built,
+        so they read the C128A fields instead of `topk_indices_buffer`.
+
+        The buffer itself is one tensor on the model, shared by every layer
+        (`DeepseekV4Model.topk_indices_buffer`), which is what lets V4.1's
+        layers read a top-k that an index-only source layer published.
+        """
+        return self.compresses and (
+            self.v41_roles is not None or self.compress_ratio == 4
+        )
+
+    def tile_sched_layer_type(self) -> str:
+        """Which FlashMLA tile-scheduler plan this layer's decode needs.
+
+        Named type, not ratio: the plan carries the layer type's topk /
+        extra_topk / page-block size, and V4.1's two compressed ratios have
+        distinct geometry from each other and from V4's c4a.
+        """
+        from vllm.v1.attention.backends.mla.sparse_swa import (
+            _LAYER_TYPE_C1A,
+            _LAYER_TYPE_C2A,
+            _LAYER_TYPE_C4A,
+            _LAYER_TYPE_C128A,
+            _LAYER_TYPE_SWAONLY,
+        )
+
+        if self.v41_roles is not None:
+            if not self.v41_roles.compression_enabled:
+                return _LAYER_TYPE_SWAONLY
+            if self.v41_roles.raw_compress_ratio == 2:
+                return _LAYER_TYPE_C2A
+            return _LAYER_TYPE_C1A
+        if self.compress_ratio <= 1:
+            return _LAYER_TYPE_SWAONLY
+        if self.compress_ratio == 4:
+            return _LAYER_TYPE_C4A
+        if self.compress_ratio == 128:
+            return _LAYER_TYPE_C128A
+        raise ValueError(
+            f"Unsupported compress_ratio={self.compress_ratio}; "
+            "expected 1, 4, or 128."
+        )
+
     def compressed_cache_and_metadata(self, attn_metadata) -> tuple[Any, Any]:
         """The paged compressed cache this layer attends over, and its metadata.
 
@@ -1064,11 +1125,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         and so has an entry of its own; the V4.1 layers reading it find the
         owner's.
         """
-        if self.v41_roles is None:
-            compresses = self.compress_ratio > 1
-        else:
-            compresses = self.v41_roles.compression_enabled
-        if not compresses:
+        if not self.compresses:
             return None, None
         return (
             self.compressed_kv_cache(),
@@ -1081,12 +1138,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         # V4.1 compresses at ratio 1 as well, so the operational ratio is not
         # what decides this -- whether the layer compresses at all is.
-        compresses = (
-            self.compress_ratio > 1
-            if self.v41_roles is None
-            else self.v41_roles.compression_enabled
-        )
-        if not compresses:
+        if not self.compresses:
             # SWA part only. Allocated separately as DeepseekV4SWACache.
             return None
         if self.compressed_cache_prefix is not None:

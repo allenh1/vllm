@@ -42,6 +42,41 @@ def _prefer_two_stage_compressor() -> bool:
     return current_platform.is_rocm()
 
 
+#: The compress ratios the head=512 CuTe DSL store kernel implements. It has
+#: exactly two specialisations -- C4-with-overlap and C128 -- and rejects
+#: everything else (`nvidia/ops/sparse_attn_compress_cutedsl.py`), so V4.1's
+#: ratios 1 and 2 have no CuTe DSL kernel to route to.
+_CUTEDSL_COMPRESS_RATIOS: tuple[int, ...] = (4, 128)
+
+
+def _compressor_store_uses_cutedsl(
+    head_dim: int, compress_ratio: int, is_cuda: bool
+) -> bool:
+    """Whether the fused compress → norm → RoPE → store step runs on CuTe DSL.
+
+    Only CUDA's head=512 path has CuTe DSL kernels, and those cover exactly the
+    ratios V4 uses. Everything else -- the indexer's head=128, non-CUDA
+    platforms, and V4.1's ratios 1 and 2 -- takes the generic triton launcher
+    `compress_norm_rope_store_triton`, whose gather is a plain
+    `tl.arange(0, COMPRESS_RATIO)` softmax with no per-ratio code in it.
+    """
+    return is_cuda and head_dim == 512 and compress_ratio in _CUTEDSL_COMPRESS_RATIOS
+
+
+def _checkpoint_has_ape(config) -> bool:
+    """Whether this checkpoint carries a compressor `ape` tensor.
+
+    V4 does: `save_partial_states` adds `ape[position % compress_ratio]` to the
+    gate score before the softmax. V4.1 does not -- the vendor's `Compressor`
+    has no positional term and the released index has no such tensor -- and the
+    two are told apart by the config, so this defers to the same V4.1 predicate
+    `attention.py` uses rather than re-deriving it.
+    """
+    from vllm.models.deepseek_v4.attention import is_deepseek_v41
+
+    return not is_deepseek_v41(config)
+
+
 def _get_c128_boundary(metadata: CommonAttentionMetadata) -> bool | None:
     starts = metadata._num_computed_tokens_cpu
     if starts is None:
@@ -149,7 +184,7 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
         compilation_config.static_forward_context[prefix] = self
 
         assert self.dtype == torch.float32
-        assert compress_ratio in [4, 128]
+        assert compress_ratio in [1, 2, 4, 128]
         coff = 1 + (compress_ratio == 4)
         self.sliding_window = coff * compress_ratio
         # Block size is constrained by tensor sharing between compressor states
@@ -158,10 +193,16 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
         # The KV block shape [256//4, head_dim] = [64, 584] determines:
         # - C4 compressor block shape [4, 2*512*2*4] -> block_size = 4
         # - C128 compressor block shape [8, 512*2*4] -> block_size = 8
+        # V4.1's ratios 1 and 2 have no overlap either, so their state row is
+        # the same 512*2*4 = 4096 B as C128's and they keep C128's block size:
+        # block_size * state_row = 32768 B for every ratio.
+        # The sliding window is the compressor's lookback -- the `coff*ratio`
+        # rows a boundary gathers -- and not a policy knob: the state cache
+        # manager retains the block holding the oldest of those rows exactly.
         # TODO(yifan): make block size automatically determined and configurable.
         if compress_ratio == 4:
             self.block_size = 4
-        elif compress_ratio == 128:
+        elif compress_ratio in (1, 2, 128):
             self.block_size = 8
         else:
             raise ValueError(f"Invalid compress ratio: {compress_ratio}")
@@ -196,8 +237,8 @@ class DeepseekCompressor(nn.Module):
     Owns the linear / norm / state-cache / ape state and the shared forward
     prologue (kv/score split, save_partial_states launch). The
     compress → norm → RoPE → store step is dispatched to a triton kernel
-    (``compress_norm_rope_store_triton``) by default, except for the NVIDIA
-    head_dim=128 indexer path which uses the cutedsl kernel
+    (``compress_norm_rope_store_triton``) by default, except for the head_dim=512
+    path on CUDA, which uses the cutedsl kernel
     (``compress_norm_rope_store_cutedsl``) for better performance.
     """
 
@@ -231,15 +272,25 @@ class DeepseekCompressor(nn.Module):
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.max_model_len = vllm_config.model_config.max_model_len
 
+        # Only C4's boundary window straddles two compression blocks and so
+        # gathers 2 rows; every other ratio compresses a single row per block.
         self.overlap = compress_ratio == 4
         self.coff = 1 + self.overlap
+        # Ratio 1 has nothing to weigh: the gate score is a single row, whose
+        # softmax is exactly 1, so the pooled latent passes through unweighted
+        # and the vendor ships no `wgate` for it.
+        self.has_gate = compress_ratio > 1
 
-        # The head=512 cr>=128 no-overlap deep gather uses the two-stage
-        # compressor, which needs an fp32 scratch [max_batched, 512] for
-        # the intermediate compressed_kv.
+        # The head=512 C128 deep gather uses the two-stage compressor, which
+        # needs an fp32 scratch [max_batched, 512] for the intermediate
+        # compressed_kv. C128 is the only ratio it has been exercised at, and
+        # V4.1's ratios 1 and 2 are served by the generic launcher anyway.
         # Currently only tested on ROCm
         self._use_two_stage_fused_compressor = (
-            _prefer_two_stage_compressor() and head_dim == 512 and not self.overlap
+            _prefer_two_stage_compressor()
+            and head_dim == 512
+            and not self.overlap
+            and compress_ratio == 128
         )
         self.max_num_batched_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens
@@ -254,18 +305,40 @@ class DeepseekCompressor(nn.Module):
             )
 
         state_dtype = torch.float32
-        self.ape = nn.Parameter(
-            torch.empty(
+        # V4.1 dropped the absolute positional embedding: its `Compressor` has no
+        # positional term and the released index carries no such tensor. The term is
+        # added to the gate score *before* the softmax, so leaving the parameter out
+        # is exact, not an approximation of zero -- but the parameter must be absent
+        # rather than left uninitialised, which the loader would faithfully leave as
+        # garbage. Keep a zero row for `ape`-taking kernels (`save_partial_states`).
+        self.ape: nn.Parameter | None = (
+            nn.Parameter(
+                torch.empty(
+                    (compress_ratio, self.coff * self.head_dim),
+                    dtype=state_dtype,
+                    device=self.device,
+                ),
+                requires_grad=False,
+            )
+            if _checkpoint_has_ape(config)
+            else None
+        )
+        self._zero_ape = (
+            None
+            if self.ape is not None
+            else torch.zeros(
                 (compress_ratio, self.coff * self.head_dim),
                 dtype=state_dtype,
                 device=self.device,
-            ),
-            requires_grad=False,
+            )
         )
 
+        # A single output shard for ratio 1: there is no gate to fuse, so the
+        # mapper's `compressor.wgate -> shard 1` entry simply never fires, and
+        # `compressor.wkv` loads into shard 0 as it does for every other ratio.
         self.fused_wkv_wgate = MergedColumnParallelLinear(
             self.hidden_size,
-            [self.coff * self.head_dim, self.coff * self.head_dim],
+            [self.coff * self.head_dim] * (2 if self.has_gate else 1),
             bias=False,
             return_bias=False,
             quant_config=None,
@@ -274,6 +347,17 @@ class DeepseekCompressor(nn.Module):
         )
         self.norm = RMSNorm(self.head_dim, self.rms_norm_eps)
 
+        # Every ratio gets a state cache, ratio 1 included. This is not the
+        # vendor's `kv_state`/`score_state` (which ratio 1 has no use for and
+        # does not allocate): in this fork the projection's output only ever
+        # reaches the store kernel *through* the state -- `save_partial_states`
+        # stages kv/score there, and the compress → norm → RoPE → store kernels
+        # gather the group's rows back out of it, one row per token for ratio 1
+        # -- so a ratio-1 layer without one would have nothing to read, no
+        # `CompressorMetadata` (the metadata builder is bound to this layer's
+        # spec) and no bound cache tensor. Its state row is the same 512*2*4 B
+        # as C128's, so it shares C128's block size and the 32768 B page the
+        # sharing invariant needs.
         self.state_cache = CompressorStateCache(
             state_dim=2 * self.coff * self.head_dim,  # kv_state + score_state
             dtype=state_dtype,
@@ -318,9 +402,16 @@ class DeepseekCompressor(nn.Module):
     ) -> None:
         # Each of shape [num_tokens, coff * self.head_dim]
         # input bf16, output are fp32
-        kv, score = kv_score.split(
-            [self.coff * self.head_dim, self.coff * self.head_dim], dim=-1
-        )
+        if self.has_gate:
+            kv, score = kv_score.split(
+                [self.coff * self.head_dim, self.coff * self.head_dim], dim=-1
+            )
+        else:
+            # No gate: the projection *is* the latent. Feeding it as the score too
+            # costs nothing -- a one-row softmax is exactly 1, so the kernel's
+            # weighted sum returns the latent unchanged -- and keeps the kernel
+            # signature free of a special case.
+            kv = score = kv_score
 
         # Get the metadata and handle dummy profiling run.
         forward_context = get_forward_context()
@@ -356,7 +447,9 @@ class DeepseekCompressor(nn.Module):
         save_partial_states(
             kv=kv,
             score=score,
-            ape=self.ape,
+            # `save_partial_states` takes the positional term as a mandatory operand
+            # and adds it to the score; a checkpoint without one adds its zeros.
+            ape=self.ape if self.ape is not None else self._zero_ape,
             positions=positions,
             state_cache=state_cache,
             slot_mapping=slot_mapping,
@@ -401,14 +494,15 @@ class DeepseekCompressor(nn.Module):
         # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
         # does not, so the two callables have different signatures.
         compress_norm_rope_store_fn: Any
-        if current_platform.is_cuda() and self.head_dim == 512:
+        if _compressor_store_uses_cutedsl(
+            self.head_dim, self.compress_ratio, current_platform.is_cuda()
+        ):
             from .nvidia.ops.sparse_attn_compress_cutedsl import (
                 compress_norm_rope_store_cutedsl,
             )
 
-            # head=512 on CUDA always uses cutedsl, for both the fp8_ds_mla
-            # layout and the plain full-cache layout. The full-cache flags
-            # are consumed only here.
+            # Both the fp8_ds_mla layout and the plain full-cache layout go
+            # through cutedsl here. The full-cache flags are consumed only here.
             compress_norm_rope_store_fn = compress_norm_rope_store_cutedsl
             extra_kwargs: dict[str, Any] = dict(
                 store_full_kv=store_full_kv,
@@ -420,7 +514,7 @@ class DeepseekCompressor(nn.Module):
                     self.eager_scratch_pool.compressor_scratch(num_actual)
                 )
         elif self._use_two_stage_fused_compressor:
-            # head=512 cr>=128 (no overlap): two-pass split compressor on the
+            # head=512 C128 (no overlap): two-pass split compressor on the
             # prefill suffix, single-pass on the decode prefix.
             assert state_metadata.num_decode_tokens is not None
             compress_norm_rope_store_fn = compress_norm_rope_store_two_stage_triton
@@ -429,7 +523,17 @@ class DeepseekCompressor(nn.Module):
                 "compress_scratch": self._compress_scratch,
             }
         else:
-            # Indexer path (head_dim == 128) or non-CUDA GPUs (AMD, XPU, etc.).
+            # Indexer path (head_dim == 128), non-CUDA GPUs (AMD, XPU, etc.)
+            # and V4.1's ratios 1 and 2, whose head=512 gather takes the
+            # generic single-pass launcher.
+            if store_full_kv and self.compress_ratio not in _CUTEDSL_COMPRESS_RATIOS:
+                raise ValueError(
+                    f"compress_ratio={self.compress_ratio} has no kernel that "
+                    "writes the plain head=512 cache layout: only the CuTe DSL "
+                    "store kernels do, and they cover ratios "
+                    f"{_CUTEDSL_COMPRESS_RATIOS}. Run with the fp8_ds_mla cache "
+                    "layout instead."
+                )
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
             extra_kwargs = {}
 

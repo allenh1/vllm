@@ -1832,6 +1832,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 # Skip non-stacked layers and experts (experts handled below).
                 if ".experts." in name:
                     continue
+                # DeepSeek-V4.1: `vision.` and `aligner.` keep unfused
+                # `w1`/`w2`/`w3` leaves and have no `gate_up_proj`, so the
+                # bare shard names below must not fold them -- the lookup
+                # is a bare `params_dict[name]` and would KeyError.
+                if "vision." in name or "aligner." in name:
+                    continue
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)

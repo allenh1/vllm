@@ -1122,8 +1122,11 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 top_k,
                 chunk_m,
                 chunk_n,
-                combined_indices=combined_indices_buffer,
-                combined_lens=combined_lens_buffer,
+                # One `out` pair, not two kwargs: the buffers come from the
+                # chunk workspace, which is the whole point of passing them --
+                # `combine_topk_swa_indices` takes the pair as a single
+                # argument and slices it to `num_tokens` itself.
+                out=(combined_indices_buffer, combined_lens_buffer),
             )
             if triton_sparse_mla_enabled:
                 self._forward_sparse_mla_prefill_triton(

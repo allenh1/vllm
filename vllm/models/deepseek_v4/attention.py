@@ -241,6 +241,10 @@ class V41LayerRoles:
         #: not run an indexer reuses the top-k its source published and never
         #: looks at the keys.
         self.index_owner_layer = index_owner_layer
+        #: The layer whose published candidate blocks this one will read, or
+        #: None at or before the source. The consumer needs the *module* to find
+        #: them, which is a prefix rewrite from here.
+        self.candidate_source_layer = candidate_source_layer
         #: Level one of the two-level top-k: this layer runs
         #: `select_candidate_blocks` on its own scores and publishes the result.
         self.is_candidate_source = is_candidate_source

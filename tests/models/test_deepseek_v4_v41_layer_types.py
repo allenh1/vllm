@@ -265,3 +265,30 @@ def test_swa_only_ratio_is_not_read_as_compressed_by_accident():
     assert ratio_zero == ratio_one == 1
     assert _classify(config, 0) == (False, False)
     assert _classify(config, 20) == (True, True)
+
+
+def test_every_declared_role_field_is_actually_assigned():
+    """`__slots__` fields must all be set, or the miss hides until it is read.
+
+    `candidate_source_layer` was declared in `__slots__`, accepted by
+    `__init__`, and read by both `__repr__` and the indexer-cache sharing --
+    but never assigned, so model construction died with
+    `AttributeError: 'V41LayerRoles' object has no attribute
+    'candidate_source_layer'` on the first boot that reached it. `__slots__`
+    gives no class-level default to paper over it, which is the point: the
+    attribute is simply absent until something asks.
+
+    Reading every slot on every layer of the real config is what turns that
+    into a caught bug. `repr()` reading all of them is why it is asserted too.
+    """
+    config = _v41_config()
+    for layer_id in range(config.num_hidden_layers + 3):
+        roles = v41_layer_roles(config, layer_id)
+        assert roles is not None
+        unset = [f for f in type(roles).__slots__ if not hasattr(roles, f)]
+        assert not unset, f"layer {layer_id}: declared but never assigned: {unset}"
+        assert "candidate_source" in repr(roles)
+    # And the value is the source layer, not just present: this is what the
+    # consumers rewrite into the source's module prefix to find the blocks.
+    assert v41_layer_roles(config, 24).candidate_source_layer == 20
+    assert v41_layer_roles(config, 36).candidate_source_layer == 20

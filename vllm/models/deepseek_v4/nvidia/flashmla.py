@@ -830,7 +830,19 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     output=output,
                 )
                 return
-            if self.compress_ratio in (4, 128):
+            # 4 and 128 are V4's compressed ratios; V4.1's are 1 and 2, which
+            # this literal does not name. `uses_indexer_topk` is the port's
+            # layer-level answer to the same question -- compressed, and driven
+            # by the indexer's top-k -- and is true for every compressed V4.1
+            # layer. On V4 it is a subset of (4, 128), so the literal stays the
+            # authority there and V4's dispatch does not move.
+            #
+            # Falling through instead is not a graceful degradation: below this
+            # block is the FlashMLA tile-scheduler path, whose metadata is
+            # allocated only for non-SM12x devices, so on this cluster an
+            # unnamed ratio lands on `tile_metadata is None` rather than on a
+            # slower kernel.
+            if self.compress_ratio in (4, 128) or self.uses_indexer_topk:
                 assert compressed_k_cache is not None
                 assert attn_metadata is not None
                 assert topk_indices is not None

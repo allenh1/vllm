@@ -4,6 +4,7 @@
 DeepseekV4 MLA Attention Layer
 """
 
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -136,12 +137,145 @@ def resolve_layer_compress_ratio(config, layer_id: int) -> tuple[int, bool]:
     clamped to >= 1 (KV-cache specs treat 1 as "no compression" and divide by
     it); a raw 0 only selects unscaled rope for that layer.
     """
+    roles = v41_layer_roles(config, layer_id)
+    if roles is not None:
+        return roles.compress_ratio, roles.use_unscaled_rope
     if layer_id < config.num_hidden_layers:
         return max(1, config.compress_ratios[layer_id]), False
     if layer_id < len(config.compress_ratios):
         raw_compress_ratio = config.compress_ratios[layer_id]
         return max(1, raw_compress_ratio), raw_compress_ratio == 0
     return 1, False
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek-V4.1 layer roles
+# ---------------------------------------------------------------------------
+#
+# V4.1 reuses the V4 attention module but reads `compress_ratios` differently
+# and shares one compressed cache across many layers instead of giving every
+# layer its own copy. Three things change, all of them keyed off the raw entry:
+#
+#   raw 0  no compression: pure sliding window on plain (unscaled) rope. V4
+#          spells the same thing, but in V4.1 it appears *inside* the backbone
+#          (layers 0 and 1), not only on the draft layer.
+#   raw 1  one latent per token: `norm(wkv(x))`, no gate, no fp32 (layers
+#          20..39). V4 has no ratio-1 mode at all -- it reads a raw 1 as
+#          "uncompressed" -- so the two readings cannot share a code path.
+#   raw 2  two tokens softmax-pooled into one latent (layers 2..19).
+#
+# The cache is shared. `kv_source_layer_ids` names the only layers that build a
+# compressor and own a compressed cache -- (2, 8, 14, 20) -- so every layer
+# between two sources reads the cache its source published instead of one of
+# its own. `index_source_layer_ids` does the same for the indexer; the entries
+# that are not also KV sources (24, 28, 32, 36) carry no `wk`/`k_norm` in the
+# checkpoint precisely because they score against the shared index keys.
+#
+# A V4 checkpoint has none of these config keys, so `is_deepseek_v41` is False
+# for it and none of this code is reached.
+
+
+class V41LayerRoles:
+    """One V4.1 layer's role, resolved from the config. See the note above."""
+
+    __slots__ = (
+        "raw_compress_ratio",
+        "compress_ratio",
+        "compression_enabled",
+        "owns_compressed_kv",
+        "runs_indexer",
+        "kv_owner_layer",
+        "use_unscaled_rope",
+    )
+
+    def __init__(
+        self,
+        raw_compress_ratio: int,
+        compress_ratio: int,
+        owns_compressed_kv: bool,
+        runs_indexer: bool,
+        kv_owner_layer: int | None,
+        use_unscaled_rope: bool,
+    ):
+        self.raw_compress_ratio = raw_compress_ratio
+        # Never 0, even for a raw 0 layer: the KV-cache specs divide by it and
+        # `compression_enabled` is what says whether the result is used.
+        self.compress_ratio = compress_ratio
+        self.compression_enabled = raw_compress_ratio > 0
+        self.owns_compressed_kv = owns_compressed_kv
+        self.runs_indexer = runs_indexer
+        #: The KV-source layer whose compressed cache and index keys this layer
+        #: reads, or None when it owns them.
+        self.kv_owner_layer = kv_owner_layer
+        self.use_unscaled_rope = use_unscaled_rope
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return (
+            f"V41LayerRoles(raw={self.raw_compress_ratio}, "
+            f"compression={self.compression_enabled}, "
+            f"owns_kv={self.owns_compressed_kv}, indexer={self.runs_indexer}, "
+            f"kv_owner={self.kv_owner_layer})"
+        )
+
+
+def is_deepseek_v41(config) -> bool:
+    """True for a V4.1 config -- the only kind that names its source layers."""
+    return getattr(config, "kv_source_layer_ids", None) is not None
+
+
+#: `model.layers.7.attn` -> head `model.layers.`, index `7`, tail `.attn`.
+_V41_LAYER_IN_PREFIX = re.compile(r"^(?P<head>.*?layers\.)(?P<index>\d+)(?P<tail>\..*)$")
+
+
+def _v41_owner_prefix(prefix: str, owner_layer_id: int) -> str:
+    """The attention prefix of `owner_layer_id`, given this layer's prefix.
+
+    Cross-layer KV sharing is keyed on the module name, so a V4.1 layer that
+    reads its source's compressed cache has to be able to name it. Both are the
+    same `...layers.<id>.attn` path with a different index, so this is a rewrite
+    of that one component rather than a second naming scheme.
+    """
+    match = _V41_LAYER_IN_PREFIX.match(prefix)
+    if match is None:
+        raise ValueError(
+            f"DeepSeek-V4.1: cannot point {prefix!r} at layer {owner_layer_id}; "
+            "its module path has no `layers.<n>` component to rewrite, so the "
+            "shared compressed-KV cache cannot be named."
+        )
+    return f"{match.group('head')}{owner_layer_id}{match.group('tail')}"
+
+
+def v41_layer_roles(config, layer_id: int) -> V41LayerRoles | None:
+    """Resolve `layer_id`'s V4.1 role, or None when this is not a V4.1 config.
+
+    `layer_id` past the backbone is a DSpark draft layer: those are
+    uncompressed (raw 0) and share nothing, matching `compress_ratios[40:]`.
+    """
+    if not is_deepseek_v41(config):
+        return None
+
+    ratios = getattr(config, "compress_ratios", None) or ()
+    raw = int(ratios[layer_id]) if layer_id < len(ratios) else 0
+
+    kv_sources = tuple(getattr(config, "kv_source_layer_ids", None) or ())
+    index_sources = tuple(getattr(config, "index_source_layer_ids", None) or ())
+
+    owns_compressed_kv = raw > 0 and layer_id in kv_sources
+    # The most recent source at or before this layer. Only a compressing layer
+    # reads a shared cache, so a raw 0 layer (including every draft layer) has
+    # no owner however many sources precede it -- it must not be put in a
+    # compressed cache group it has no spec for.
+    owner = max((s for s in kv_sources if s <= layer_id), default=None)
+
+    return V41LayerRoles(
+        raw_compress_ratio=raw,
+        compress_ratio=max(1, raw),
+        owns_compressed_kv=owns_compressed_kv,
+        runs_indexer=raw > 0 and layer_id in index_sources,
+        kv_owner_layer=None if (owns_compressed_kv or raw == 0) else owner,
+        # A raw 0 layer is trained on plain rope; so is the draft layer.
+        use_unscaled_rope=raw == 0,
+    )
 
 
 class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
@@ -236,6 +370,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self.compress_ratio, use_unscaled_rope = resolve_layer_compress_ratio(
             config, layer_id
         )
+        # DeepSeek-V4.1 only: which layers own the compressed cache and which
+        # read someone else's. None on V4, where every layer owns its own.
+        self.v41_roles = v41_layer_roles(config, layer_id)
+        self.layer_id = layer_id
+        self.prefix = prefix
         self.eps = config.rms_norm_eps
         self.scale = self.head_dim**-0.5
 
@@ -315,14 +454,27 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             max_position_embeddings=config.max_position_embeddings,
             compress_ratio=self.compress_ratio,
             use_unscaled_rope=use_unscaled_rope,
+            use_compress_rope_theta=(
+                None
+                if self.v41_roles is None
+                else self.v41_roles.compression_enabled
+            ),
         )
         self.indexer_rotary_emb = self.rotary_emb
         self.topk_indices_buffer = topk_indices_buffer
         self.eager_scratch_pool = eager_scratch_pool
 
         self.indexer = None
-        if self.compress_ratio == 4:
-            # Only C4A uses sparse attention and hence has indexer.
+        # V4 gates the indexer on the ratio (only C4A has one); V4.1 names the
+        # layers that run one, which is a different set entirely -- the
+        # index-only sources 24/28/32/36 have no compressor of their own but do
+        # have an indexer, and the ratio-1 source 20 has one too.
+        build_indexer = (
+            self.compress_ratio == 4
+            if self.v41_roles is None
+            else self.v41_roles.runs_indexer
+        )
+        if build_indexer:
             # aux_stream_list[2] is free here (outer GEMMs joined) for the inner
             # overlap of wq_b+fused_indexer_q_rope_quant vs compressor. None on
             # ROCm, where aux_stream_list is None.
@@ -393,8 +545,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
         # Create the compressor for layers with compress_ratio > 1; after the
         # attention setup above so its KV-cache prefix (self.prefix) is set.
+        # V4.1 compresses at ratio 1 too, but only its KV sources carry the
+        # weights -- the layers in between read the cache their source wrote,
+        # which is what `kv_sharing_target_layer_name` below arranges.
         self.compressor = None
-        if self.compress_ratio > 1:
+        build_compressor = (
+            self.compress_ratio > 1
+            if self.v41_roles is None
+            else self.v41_roles.owns_compressed_kv
+        )
+        if build_compressor:
             self.compressor = DeepseekCompressor(
                 vllm_config=vllm_config,
                 compress_ratio=self.compress_ratio,
@@ -404,6 +564,18 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 prefix=f"{prefix}.compressor",
                 k_cache_prefix=self.prefix,
                 eager_scratch_pool=eager_scratch_pool,
+            )
+
+        # Cross-layer KV sharing: a V4.1 layer that does not own the compressed
+        # cache declares which layer's it reads, and the worker then puts it in
+        # that layer's KV-cache group, so it is handed the same paged tensor and
+        # the same block table. `swa_cache` is deliberately left out -- the
+        # sliding window is per-layer in V4.1, only the compressed positions are
+        # shared.
+        self.kv_sharing_target_layer_name = None
+        if self.v41_roles is not None and self.v41_roles.kv_owner_layer is not None:
+            self.kv_sharing_target_layer_name = _v41_owner_prefix(
+                prefix, self.v41_roles.kv_owner_layer
             )
 
     @staticmethod
@@ -865,9 +1037,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         return self.backend_cls
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
-        if (
-            self.compress_ratio <= 1
-        ):  # SWA part. Allocated separately as DeepseekV4SWACache.
+        # V4.1 compresses at ratio 1 as well, so the operational ratio is not
+        # what decides this -- whether the layer compresses at all is.
+        compresses = (
+            self.compress_ratio > 1
+            if self.v41_roles is None
+            else self.v41_roles.compression_enabled
+        )
+        if not compresses:
+            # SWA part only. Allocated separately as DeepseekV4SWACache.
+            return None
+        if self.kv_sharing_target_layer_name is not None:
+            # Reads its source's paged cache; declaring a spec here would
+            # allocate a second copy that nothing ever writes.
             return None
         # fp8_ds_mla is a UE8M0 block-scaled uint8 layout and needs 576B
         # alignment; plain bf16 / per-tensor fp8 rows use natural element-size

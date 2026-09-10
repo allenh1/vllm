@@ -16,11 +16,20 @@ def build_deepseek_v4_rope(
     max_position_embeddings: int,
     compress_ratio: int,
     use_unscaled_rope: bool = False,
+    use_compress_rope_theta: bool | None = None,
 ) -> RotaryEmbedding:
     # Copy so per-layer overrides cannot leak into the shared hf_config dict.
     rope_parameters = dict(config.rope_parameters)
+    if use_compress_rope_theta is None:
+        # V4's rule: only a real pooling ratio moves off the base theta. That
+        # is the wrong test for DeepSeek-V4.1, where a raw ratio of 1 means
+        # "one latent per token" and *does* use the compressed theta, while a
+        # raw 0 means no compression at all -- so V4.1 callers pass the flag
+        # explicitly, derived from the raw entry rather than the operational
+        # ratio (which is clamped to >= 1 and so cannot tell them apart).
+        use_compress_rope_theta = compress_ratio > 1
     rope_parameters["rope_theta"] = (
-        config.compress_rope_theta if compress_ratio > 1 else config.rope_theta
+        config.compress_rope_theta if use_compress_rope_theta else config.rope_theta
     )
     if use_unscaled_rope:
         # The MTP draft layer of DSpark-style checkpoints (compress_ratios

@@ -106,6 +106,137 @@ def test_scaled_rope_unchanged_without_flag(default_vllm_config):
     assert isinstance(rope, DeepseekV4ScalingRotaryEmbedding)
 
 
+# ---------------------------------------------------------------------------
+# DeepSeek-V4.1
+# ---------------------------------------------------------------------------
+#
+# V4.1 keeps V4's classes but reads `compress_ratios` differently and names the
+# layers that own the shared compressed cache. `_config` deliberately has none
+# of the V4.1 keys, so every test above is also the regression check that a V4
+# checkpoint still resolves exactly as it did.
+
+
+def _v41_config() -> types.SimpleNamespace:
+    """The real DeepSeek-V4.1-Flash text config, minus the fields we don't read."""
+    config = _config([0, 0] + [2] * 18 + [1] * 20 + [0, 0, 0])
+    config.num_hidden_layers = 40
+    config.kv_source_layer_ids = [2, 8, 14, 20]
+    config.index_source_layer_ids = [2, 8, 14, 20, 24, 28, 32, 36]
+    return config
+
+
+def test_v4_configs_have_no_v41_roles():
+    # The gate: everything V4.1-specific is off unless the config names sources.
+    from vllm.models.deepseek_v4.attention import v41_layer_roles
+
+    assert v41_layer_roles(_config([1, 4, 4, 1]), 1) is None
+
+
+def test_v41_compression_is_keyed_on_the_raw_entry():
+    from vllm.models.deepseek_v4.attention import v41_layer_roles
+
+    config = _v41_config()
+    # raw 0 (layers 0, 1) is plain sliding window -- and, unlike V4, it sits
+    # inside the backbone rather than only on the draft layer.
+    for layer_id in (0, 1):
+        roles = v41_layer_roles(config, layer_id)
+        assert not roles.compression_enabled
+        assert roles.compress_ratio == 1  # spec-safe, but unused
+        assert roles.use_unscaled_rope
+        assert not roles.owns_compressed_kv
+        assert not roles.runs_indexer
+    # raw 1 (layer 20) compresses at ratio 1, and uses the compressed theta.
+    roles = v41_layer_roles(config, 20)
+    assert roles.compression_enabled
+    assert roles.compress_ratio == 1
+    assert not roles.use_unscaled_rope
+    # raw 2 pools pairs.
+    roles = v41_layer_roles(config, 2)
+    assert roles.compress_ratio == 2
+    assert not roles.use_unscaled_rope
+
+
+def test_v41_only_the_configured_layers_own_each_cache():
+    from vllm.models.deepseek_v4.attention import v41_layer_roles
+
+    config = _v41_config()
+    kv_owners = [i for i in range(40) if v41_layer_roles(config, i).owns_compressed_kv]
+    assert kv_owners == [2, 8, 14, 20]
+    indexers = [i for i in range(40) if v41_layer_roles(config, i).runs_indexer]
+    assert indexers == [2, 8, 14, 20, 24, 28, 32, 36]
+
+
+@pytest.mark.parametrize(
+    "layer_id,expected_owner",
+    [
+        (0, None),  # raw 0, shares nothing
+        (2, None),  # owns
+        (3, 2),
+        (7, 2),
+        (8, None),
+        (13, 8),
+        (14, None),
+        (19, 14),
+        (20, None),
+        (21, 20),
+        (24, 20),  # index-only source: own indexer, layer 20's compressed KV
+        (36, 20),
+        (39, 20),
+    ],
+)
+def test_v41_each_layer_reads_the_most_recent_source(layer_id: int, expected_owner):
+    from vllm.models.deepseek_v4.attention import v41_layer_roles
+
+    assert v41_layer_roles(_v41_config(), layer_id).kv_owner_layer == expected_owner
+
+
+def test_v41_draft_layers_are_uncompressed():
+    from vllm.models.deepseek_v4.attention import v41_layer_roles
+
+    # compress_ratios[40:] is [0, 0, 0] and the DSpark layers share nothing.
+    for layer_id in (40, 41, 42, 43):
+        roles = v41_layer_roles(_v41_config(), layer_id)
+        assert not roles.compression_enabled
+        assert not roles.owns_compressed_kv
+        assert roles.kv_owner_layer is None
+
+
+def test_v41_owner_prefix_rewrites_only_the_layer_index():
+    from vllm.models.deepseek_v4.attention import _v41_owner_prefix
+
+    assert _v41_owner_prefix("model.layers.7.attn", 2) == "model.layers.2.attn"
+    assert _v41_owner_prefix("layers.39.attn", 20) == "layers.20.attn"
+    with pytest.raises(ValueError):
+        _v41_owner_prefix("mtp.0.attn", 2)
+
+
+def test_v41_ratio_one_uses_the_compressed_rope_theta(default_vllm_config):
+    # The bug this guards: `compress_rope_theta if compress_ratio > 1` picks the
+    # base theta for a raw ratio of 1, but V4.1 trained layer 20 on the
+    # compressed one. The flag is what tells the two apart, since the
+    # operational ratio is clamped to 1 for the uncompressed layers as well.
+    config = _v41_config()
+
+    def cache(*, use_compress_rope_theta: bool | None, compress_ratio: int = 1):
+        _ROPE_DICT.clear()  # the builder caches by parameters; force a rebuild
+        return build_deepseek_v4_rope(
+            config,
+            head_dim=64,
+            rope_head_dim=64,
+            max_position_embeddings=config.max_position_embeddings,
+            compress_ratio=compress_ratio,
+            use_compress_rope_theta=use_compress_rope_theta,
+        ).cos_sin_cache.clone()
+
+    compressed = cache(use_compress_rope_theta=True)
+    base = cache(use_compress_rope_theta=False)
+    assert not torch.equal(compressed, base)
+    # Omitted, the flag falls back to V4's `compress_ratio > 1` rule, which for
+    # an operational ratio of 1 means the base theta.
+    assert torch.equal(cache(use_compress_rope_theta=None), base)
+    assert torch.equal(cache(use_compress_rope_theta=None, compress_ratio=4), compressed)
+
+
 def test_attention_init_wires_the_resolver():
     # Guards the production wiring: the resolver and rope builder are unit
     # tested above, but a refactor that reverts DeepseekV4Attention.__init__
